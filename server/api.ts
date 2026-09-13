@@ -3,7 +3,8 @@
 // requireAdmin, and every route handler) but never imported them. That is
 // a compile-breaking error in TypeScript — this import makes the file
 // actually compile.
-import express, { Request, Response, NextFunction } from 'express';
+import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
