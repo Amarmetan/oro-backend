@@ -536,7 +536,19 @@ export function verify_init_data(initData: string, botToken: string = process.en
 
     // Constant-time compare
     const match = crypto.timingSafeEqual(Buffer.from(computedHash, 'utf8'), Buffer.from(receivedHash, 'utf8'));
-    if (!match && process.env.NODE_ENV === 'production') {
+
+    // === FIX #2: Signature enforcement must not depend on NODE_ENV ===
+    // The original code only rejected a bad/forged hash when
+    // NODE_ENV === 'production'. In any other environment (staging, or
+    // simply an unset NODE_ENV, which is common in many deployments) a
+    // forged initData payload with a bogus hash was accepted, letting
+    // anyone impersonate any Telegram user_id -- including the admin
+    // account (7770001). The signature check is a core auth guarantee
+    // and must always be enforced once a hash is present. The "no
+    // signature at all" demo path above (the `!receivedHash` branch,
+    // gated on absence of a bot token) is left untouched for legitimate
+    // local/demo use without a real bot token.
+    if (!match) {
       return null;
     }
 
@@ -637,7 +649,17 @@ export async function purchase_single_movie( userId: number, movieId: number, pu
     }
 
     // 5. Check if user already has an active purchase
-    const existing = db.prepare(` SELECT * FROM purchases WHERE user_id = ? AND movie_id = ? AND (purchase_type = 'lifetime' OR expires_at > datetime('now')) ORDER BY id DESC LIMIT 1 `).get(userId, movieId) as any;
+    //
+    // === FIX #1: Recognize folder-bundle ownership too ===
+    // Movies bought as part of a category "folder" bundle are stored with
+    // purchase_type = 'folder' and expires_at = NULL (see purchase_folder
+    // below). The original WHERE clause only matched
+    // purchase_type = 'lifetime' OR expires_at > now, so a folder purchase
+    // was invisible here. That let a user who already owned a movie via a
+    // bundle buy the very same movie again individually and be charged a
+    // second time. 'folder' is now included alongside 'lifetime' as a
+    // permanent-ownership type.
+    const existing = db.prepare(` SELECT * FROM purchases WHERE user_id = ? AND movie_id = ? AND (purchase_type IN ('lifetime', 'folder') OR expires_at > datetime('now')) ORDER BY id DESC LIMIT 1 `).get(userId, movieId) as any;
 
     if (existing) {
       db.exec('ROLLBACK;');
@@ -645,6 +667,8 @@ export async function purchase_single_movie( userId: number, movieId: number, pu
         success: false,
         message: existing.purchase_type === 'lifetime'
           ? 'You already own lifetime access to this film.'
+          : existing.purchase_type === 'folder'
+          ? 'You already own this film through a folder bundle purchase.'
           : 'You already have an active rental for this movie.',
       };
     }
@@ -831,8 +855,20 @@ export async function request_payout_atomic( partnerId: number, amount: number, 
     const payoutId = Number(insertRes.lastInsertRowid);
     const refId = `PAYOUT-REQ-${payoutId}`;
 
-    // Ledger: Partner debit to Escrow
+    // Ledger: Partner debit (funds leave the partner's spendable commission balance)
     db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'partner', ?, ?, 0, ?, ?, ?) `).run(now, partnerId, amount, newCommissionBal, refId, `Payout request #${payoutId} held in escrow pending admin review`);
+
+    // === FIX #3 (part A): Add the missing offsetting escrow leg ===
+    // The original code only wrote the partner-side debit above. That left
+    // this transaction with a debit and no matching credit anywhere in the
+    // ledger for the entire time the request sits pending, so
+    // reconcile_ledger_report() would see total_debits != total_credits
+    // and falsely report an unbalanced ledger. The schema already
+    // anticipates an 'escrow' account_type in its column comment; we now
+    // actually use it: the funds are credited into escrow the moment they
+    // leave the partner's balance, and process_payout_atomic (below) moves
+    // them out of escrow again on approval or reversal on rejection.
+    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'escrow', ?, 0, ?, 0, ?, ?) `).run(now, partnerId, amount, refId, `Escrow hold for pending payout request #${payoutId}`);
 
     db.exec('COMMIT;');
     return {
@@ -869,6 +905,12 @@ export async function process_payout_atomic( payoutId: number, action: 'approve'
     if (action === 'approve') {
       db.prepare("UPDATE payout_requests SET status = 'approved', processed_at = ? WHERE id = ?").run(now, payoutId);
 
+      // === FIX #3 (part B): Release the escrow hold created in request_payout_atomic ===
+      // This debit closes out the escrow credit booked when the request was
+      // submitted, so the funds move cleanly from escrow to "disbursed"
+      // rather than vanishing from one side of the ledger.
+      db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'escrow', ?, ?, 0, 0, ?, ?) `).run(now, payout.partner_id, payout.amount, refId, `Escrow released for approved payout #${payoutId}`);
+
       // Finalize ledger entries:
       // 1. Platform cash disbursement of net_amount (Credit asset)
       db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'platform', 0, 0, ?, 0, ?, ?) `).run(now, payout.net_amount, refId, `Disbursed ${payout.net_amount} ETB to ${payout.payout_name} via ${payout.payout_method}`);
@@ -886,6 +928,12 @@ export async function process_payout_atomic( payoutId: number, action: 'approve'
       if (partner) {
         const refundedBal = Math.round((partner.commission_balance + payout.amount) * 100) / 100;
         db.prepare('UPDATE partners SET commission_balance = ? WHERE user_id = ?').run(refundedBal, payout.partner_id);
+
+        // === FIX #3 (part B, cont'd): Release escrow on rejection too ===
+        // Symmetric with the approval path: the escrow credit booked at
+        // request time is reversed here since the funds are going back to
+        // the partner's balance instead of being disbursed.
+        db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'escrow', ?, ?, 0, 0, ?, ?) `).run(now, payout.partner_id, payout.amount, refId, `Escrow released for rejected payout #${payoutId}`);
 
         db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'partner', ?, 0, ?, ?, ?, ?) `).run(now, payout.partner_id, payout.amount, refundedBal, refId, `Refunded rejected payout #${payoutId}: ${adminNotes}`);
       }
@@ -1017,6 +1065,21 @@ export async function adjust_balance_atomic( userId: number, amount: number, rea
       `Admin #${adminId} adjustment: ${reason}`
     );
 
+    // === FIX #3 (part C): Add the missing platform-side offsetting entry ===
+    // The original code only wrote the buyer-side leg. A positive
+    // adjustment (crediting the user) needs an offsetting platform debit
+    // (money going out), and a negative adjustment (debiting the user)
+    // needs an offsetting platform credit (money coming back in) —
+    // otherwise every admin adjustment permanently unbalances the ledger
+    // that reconcile_ledger_report() checks.
+    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'admin_adjustment', 'platform', 0, ?, ?, 0, ?, ?) `).run(
+      now,
+      amount > 0 ? amount : 0,
+      amount < 0 ? Math.abs(amount) : 0,
+      refId,
+      `Platform-side offset for admin #${adminId} adjustment: ${reason}`
+    );
+
     db.exec('COMMIT;');
     return {
       success: true,
@@ -1086,8 +1149,15 @@ export async function redeem_coupon_atomic( userId: number, couponCode: string )
 
     const refId = `COUPON-${normalizedCode}-${userId}`;
 
-    // Ledger entry
+    // Ledger entry (buyer side)
     db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'coupon_reward', 'buyer', ?, 0, ?, ?, ?, ?) `).run(now, userId, rewardAmount, newBalance, refId, `Redeemed promo voucher: ${normalizedCode}`);
+
+    // === FIX #3 (part D): Add the missing platform-side offsetting entry ===
+    // The original code credited the buyer's balance with no matching
+    // debit anywhere, meaning every coupon redemption permanently
+    // unbalanced total_debits vs total_credits in reconcile_ledger_report().
+    // The platform is the one funding the promo, so it takes the debit.
+    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'coupon_reward', 'platform', 0, ?, 0, 0, ?, ?) `).run(now, rewardAmount, refId, `Platform-funded coupon reward: ${normalizedCode}`);
 
     db.exec('COMMIT;');
     return {
