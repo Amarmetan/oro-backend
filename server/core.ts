@@ -46,20 +46,160 @@ export const DB_LOCK = new Mutex();
 
 /** * Initialize database schema */
 export function initDatabase() {
-  db.exec(` CREATE TABLE IF NOT EXISTS users ( user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT, balance REAL NOT NULL DEFAULT 0.0, is_vip INTEGER NOT NULL DEFAULT 0, vip_until TEXT, points INTEGER NOT NULL DEFAULT 0, is_admin INTEGER NOT NULL DEFAULT 0, is_partner INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL ); CREATE TABLE IF NOT EXISTS movies ( id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, original_title TEXT, category TEXT NOT NULL, description TEXT, poster_url TEXT NOT NULL, trailer_url TEXT, file_id TEXT, regular_price REAL NOT NULL, vip_price REAL NOT NULL, discount_percent INTEGER NOT NULL DEFAULT 0, is_popular INTEGER NOT NULL DEFAULT 0, rental_duration_hours INTEGER NOT NULL DEFAULT 72, allow_lifetime INTEGER NOT NULL DEFAULT 1, partner_id INTEGER, partner_cut_percent REAL NOT NULL DEFAULT 70.0, approval_status TEXT NOT NULL DEFAULT 'active', -- active, pending, rejected release_year INTEGER NOT NULL, quality TEXT NOT NULL DEFAULT '1080p FHD', languages TEXT NOT NULL DEFAULT 'Afan Oromo', created_at TEXT NOT NULL, FOREIGN KEY (partner_id) REFERENCES users(user_id) ); CREATE TABLE IF NOT EXISTS purchases ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, movie_id INTEGER NOT NULL, amount_paid REAL NOT NULL, purchase_type TEXT NOT NULL, -- rental, lifetime, folder folder_category TEXT, expires_at TEXT, -- NULL for lifetime created_at TEXT NOT NULL, FOREIGN KEY (user_id) REFERENCES users(user_id), FOREIGN KEY (movie_id) REFERENCES movies(id) ); CREATE TABLE IF NOT EXISTS partners ( user_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'active', -- active, suspended commission_balance REAL NOT NULL DEFAULT 0.0, total_earned REAL NOT NULL DEFAULT 0.0, channel_link TEXT, payout_method TEXT NOT NULL DEFAULT 'telebirr', payout_account TEXT NOT NULL, payout_name TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY (user_id) REFERENCES users(user_id) ); CREATE TABLE IF NOT EXISTS partner_applications ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL, phone TEXT NOT NULL, channel_or_portfolio TEXT, category_focus TEXT, status TEXT NOT NULL DEFAULT 'pending', -- pending, approved, rejected created_at TEXT NOT NULL, FOREIGN KEY (user_id) REFERENCES users(user_id) ); CREATE TABLE IF NOT EXISTS transactions ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount REAL NOT NULL, payment_method TEXT NOT NULL, -- telebirr, cbe, ebirr, sinqee screenshot_url TEXT, reference_code TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', -- pending, approved, rejected admin_notes TEXT, created_at TEXT NOT NULL, reviewed_at TEXT, FOREIGN KEY (user_id) REFERENCES users(user_id) ); CREATE TABLE IF NOT EXISTS payout_requests ( id INTEGER PRIMARY KEY AUTOINCREMENT, partner_id INTEGER NOT NULL, amount REAL NOT NULL, fee REAL NOT NULL, net_amount REAL NOT NULL, payout_method TEXT NOT NULL, payout_account TEXT NOT NULL, payout_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', -- pending, approved, rejected created_at TEXT NOT NULL, processed_at TEXT, FOREIGN KEY (partner_id) REFERENCES partners(user_id) ); CREATE TABLE IF NOT EXISTS ledger_entries ( id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, transaction_type TEXT NOT NULL, -- deposit, movie_purchase, folder_purchase, partner_commission, partner_payout, admin_adjustment, coupon_reward account_type TEXT NOT NULL, -- buyer, partner, platform, escrow account_id INTEGER NOT NULL, -- user_id or 0 for platform debit REAL NOT NULL DEFAULT 0.0, credit REAL NOT NULL DEFAULT 0.0, balance_after REAL NOT NULL, reference_id TEXT NOT NULL, description TEXT NOT NULL ); CREATE TABLE IF NOT EXISTS coupons ( code TEXT PRIMARY KEY, discount_amount REAL NOT NULL, max_uses INTEGER NOT NULL DEFAULT 100, times_used INTEGER NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1, expires_at TEXT ); CREATE TABLE IF NOT EXISTS coupon_redemptions ( id INTEGER PRIMARY KEY AUTOINCREMENT, coupon_code TEXT NOT NULL, user_id INTEGER NOT NULL, redeemed_at TEXT NOT NULL, UNIQUE(coupon_code, user_id), FOREIGN KEY (coupon_code) REFERENCES coupons(code), FOREIGN KEY (user_id) REFERENCES users(user_id) ); CREATE TABLE IF NOT EXISTS settings ( key TEXT PRIMARY KEY, value TEXT NOT NULL ); CREATE TABLE IF NOT EXISTS announcements ( id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, content TEXT NOT NULL, media_url TEXT, action_link TEXT, badge TEXT DEFAULT 'NEW RELEASE', is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL ); `);
+  db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+  user_id INTEGER PRIMARY KEY,
+  username TEXT,
+  first_name TEXT,
+  last_name TEXT,
+  balance REAL NOT NULL DEFAULT 0.0,
+  is_vip INTEGER NOT NULL DEFAULT 0,
+  vip_until TEXT,
+  points INTEGER NOT NULL DEFAULT 0,
+  is_admin INTEGER NOT NULL DEFAULT 0,
+  is_partner INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
 
-  seedDefaultData();
+CREATE TABLE IF NOT EXISTS movies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  original_title TEXT,
+  category TEXT NOT NULL,
+  description TEXT,
+  poster_url TEXT NOT NULL,
+  trailer_url TEXT,
+  file_id TEXT,
+  regular_price REAL NOT NULL,
+  vip_price REAL NOT NULL,
+  discount_percent INTEGER NOT NULL DEFAULT 0,
+  is_popular INTEGER NOT NULL DEFAULT 0,
+  rental_duration_hours INTEGER NOT NULL DEFAULT 72,
+  allow_lifetime INTEGER NOT NULL DEFAULT 1,
+  partner_id INTEGER,
+  partner_cut_percent REAL NOT NULL DEFAULT 70.0,
+  approval_status TEXT NOT NULL DEFAULT 'active',
+  release_year INTEGER NOT NULL,
+  quality TEXT NOT NULL DEFAULT '1080p FHD',
+  languages TEXT NOT NULL DEFAULT 'Afan Oromo',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (partner_id) REFERENCES users(user_id)
+);
 
-  // Ensure bot_deep_link column exists on movies table
-  try {
-    db.exec('ALTER TABLE movies ADD COLUMN bot_deep_link TEXT;');
-  } catch (e) {}
+CREATE TABLE IF NOT EXISTS purchases (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  movie_id INTEGER NOT NULL,
+  amount_paid REAL NOT NULL,
+  purchase_type TEXT NOT NULL,
+  folder_category TEXT,
+  expires_at TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(user_id),
+  FOREIGN KEY (movie_id) REFERENCES movies(id)
+);
 
-  // Ensure is_registered, phone_number, and preferred_language columns exist on users table
-  try {
-    db.exec('ALTER TABLE users ADD COLUMN is_registered INTEGER NOT NULL DEFAULT 0;');
-  } catch (e) {}
-  try {
+CREATE TABLE IF NOT EXISTS partners (
+  user_id INTEGER PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'active',
+  commission_balance REAL NOT NULL DEFAULT 0.0,
+  total_earned REAL NOT NULL DEFAULT 0.0,
+  channel_link TEXT,
+  payout_method TEXT NOT NULL DEFAULT 'telebirr',
+  payout_account TEXT NOT NULL,
+  payout_name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS partner_applications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  phone TEXT NOT NULL,
+  channel_or_portfolio TEXT,
+  category_focus TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  amount REAL NOT NULL,
+  payment_method TEXT NOT NULL,
+  screenshot_url TEXT,
+  reference_code TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  admin_notes TEXT,
+  created_at TEXT NOT NULL,
+  reviewed_at TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS payout_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  partner_id INTEGER NOT NULL,
+  amount REAL NOT NULL,
+  fee REAL NOT NULL,
+  net_amount REAL NOT NULL,
+  payout_method TEXT NOT NULL,
+  payout_account TEXT NOT NULL,
+  payout_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  processed_at TEXT,
+  FOREIGN KEY (partner_id) REFERENCES partners(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS ledger_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp TEXT NOT NULL,
+  transaction_type TEXT NOT NULL,
+  account_type TEXT NOT NULL,
+  account_id INTEGER NOT NULL,
+  debit REAL NOT NULL DEFAULT 0.0,
+  credit REAL NOT NULL DEFAULT 0.0,
+  balance_after REAL NOT NULL,
+  reference_id TEXT NOT NULL,
+  description TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS coupons (
+  code TEXT PRIMARY KEY,
+  discount_amount REAL NOT NULL,
+  max_uses INTEGER NOT NULL DEFAULT 100,
+  times_used INTEGER NOT NULL DEFAULT 0,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  expires_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS coupon_redemptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  coupon_code TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  redeemed_at TEXT NOT NULL,
+  UNIQUE(coupon_code, user_id),
+  FOREIGN KEY (coupon_code) REFERENCES coupons(code),
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS announcements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  media_url TEXT,
+  action_link TEXT,
+  badge TEXT DEFAULT 'NEW RELEASE',
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);`);
     db.exec('ALTER TABLE users ADD COLUMN phone_number TEXT;');
   } catch (e) {}
   try {
