@@ -1,4 +1,4 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express from 'express';
 import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -20,7 +20,7 @@ import {
   get_setting,
 } from './core.ts';
 
-export const apiRouter = Router();
+export const apiRouter = express.Router();
 
 // Ensure uploads directory exists
 const uploadsDir = path.resolve(process.cwd(), 'uploads');
