@@ -18,7 +18,7 @@ import {
   format_price_label,
   format_movie_badges,
   get_setting,
-} from './core.js';
+} from './core.ts';
 
 export const apiRouter = Router();
 
