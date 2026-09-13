@@ -1,9 +1,15 @@
-import express from 'express';
+// FIX #1: The original file used `Request`, `Response`, and `NextFunction`
+// as type annotations throughout (in AuthenticatedRequest, authMiddleware,
+// requireAdmin, and every route handler) but never imported them. That is
+// a compile-breaking error in TypeScript — this import makes the file
+// actually compile.
+import express, { Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
 import {
   db,
+  DB_LOCK,
   verify_init_data,
   purchase_single_movie,
   purchase_folder,
@@ -41,9 +47,29 @@ const storage = multer.diskStorage({
   },
 });
 
+// FIX #6a: Reject obviously dangerous file types (executables, scripts,
+// server-side templates, and SVG — which can carry embedded scripts and
+// enable stored XSS when later rendered as an <img>/media source).
+// Screenshots, posters, and teaser media only ever need image/video/pdf
+// formats, so blocking this list closes off arbitrary-file-upload risk
+// without restricting legitimate use cases.
+const DISALLOWED_UPLOAD_EXTENSIONS = new Set([
+  '.exe', '.sh', '.bat', '.cmd', '.com', '.msi', '.dll',
+  '.php', '.phtml', '.js', '.mjs', '.cjs', '.py', '.rb', '.pl',
+  '.jar', '.html', '.htm', '.svg',
+]);
+
 const upload = multer({
   storage,
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB for screenshots, media, posters, teasers
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (DISALLOWED_UPLOAD_EXTENSIONS.has(ext)) {
+      cb(new Error(`Files of type "${ext}" are not allowed.`));
+      return;
+    }
+    cb(null, true);
+  },
 });
 
 // Extend Request interface
@@ -55,6 +81,15 @@ interface AuthenticatedRequest extends Request {
 
 // Admin whitelist for Oro Records system (authorized Telegram IDs)
 const ADMIN_WHITELIST: number[] = [7770001];
+
+// FIX #7: Small helper so every route that reads a numeric :id param
+// validates it consistently, instead of silently passing NaN into a
+// prepared statement (which either throws an unhandled-looking 500 or,
+// depending on the driver, silently matches nothing).
+function parseIdParam(raw: string): number | null {
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) ? n : null;
+}
 
 /** * Authentication Middleware: * Checks Telegram WebApp initData header first. * If running in companion applet simulator, allows selecting test persona via 'x-mock-user-id'. * Enforces RBAC by strictly preserving is_admin from database and admin whitelist. */
 function authMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunction) {
@@ -108,7 +143,18 @@ function authMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunc
 
   // RBAC Integrity: Ensure is_admin is strictly 1 ONLY for admin accounts
   if (user) {
-    const isSuperAdmin = ADMIN_WHITELIST.includes(user.user_id) || user.username === 'oroadmin' || user.is_admin === 1;
+    // FIX #2 (critical security fix): the original check also granted
+    // admin rights to any account whose *username* equaled 'oroadmin':
+    //   const isSuperAdmin = ADMIN_WHITELIST.includes(user.user_id) || user.username === 'oroadmin' || user.is_admin === 1;
+    // username is fully user-controlled via POST /api/user/register (no
+    // uniqueness or reserved-word check there), so any visitor could
+    // rename themselves to "oroadmin" and pass every requireAdmin() gate
+    // below — full privilege escalation to admin. The OR'd
+    // `user.is_admin === 1` read was also redundant with (and could
+    // drift from) the whitelist. Admin status is now derived from
+    // ADMIN_WHITELIST alone, which matches the RBAC hardening already
+    // enforced in initDatabase() at startup.
+    const isSuperAdmin = ADMIN_WHITELIST.includes(user.user_id);
     user.is_admin = isSuperAdmin ? 1 : 0;
   }
 
@@ -213,8 +259,8 @@ apiRouter.get('/movies', (req: AuthenticatedRequest, res: Response) => {
 
     query += ' ORDER BY is_popular DESC, release_year DESC, id DESC';
 
-    const p = Math.max(1, parseInt(page as string, 10));
-    const lim = Math.max(1, parseInt(limit as string, 10));
+    const p = Math.max(1, parseInt(page as string, 10) || 1);
+    const lim = Math.max(1, parseInt(limit as string, 10) || 24);
     const offset = (p - 1) * lim;
 
     query += ' LIMIT ? OFFSET ?';
@@ -258,7 +304,13 @@ apiRouter.get('/movies', (req: AuthenticatedRequest, res: Response) => {
 /** * GET /api/movies/:id - Detail, respecting approval_status='active' (or partner/admin access) */
 apiRouter.get('/movies/:id', (req: AuthenticatedRequest, res: Response) => {
   try {
-    const id = parseInt(req.params.id, 10);
+    // FIX #7: validate the id param instead of letting a bad value
+    // (e.g. /movies/abc) reach the prepared statement as NaN.
+    const id = parseIdParam(req.params.id);
+    if (id === null) {
+      return res.status(400).json({ success: false, message: 'Invalid movie id' });
+    }
+
     const movie = db.prepare('SELECT * FROM movies WHERE id = ?').get(id) as any;
 
     if (!movie) {
@@ -325,7 +377,12 @@ apiRouter.get('/movies/:id', (req: AuthenticatedRequest, res: Response) => {
 /** * POST /api/purchase/:movie_id - wraps purchase_single_movie */
 apiRouter.post('/purchase/:movie_id', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const movieId = parseInt(req.params.movie_id, 10);
+    // FIX #7: validate the id param up front.
+    const movieId = parseIdParam(req.params.movie_id);
+    if (movieId === null) {
+      return res.status(400).json({ success: false, message: 'Invalid movie id' });
+    }
+
     const { purchase_type = 'rental' } = req.body;
     const userId = req.currentUserId!;
 
@@ -525,14 +582,21 @@ apiRouter.post('/deposit', upload.single('screenshot_file'), (req: Authenticated
     }
 
     const now = new Date().toISOString();
+
+    // FIX #4: store the *normalized* (validated, lowercase) payment
+    // method rather than the raw request value. The original code
+    // validated against `normalizedMethod` but then inserted the raw
+    // `payment_method` field, so a value like "Telebirr" or "TELEBIRR"
+    // would pass validation yet be stored with inconsistent casing —
+    // breaking any later exact-match filtering/reporting on this column.
     const insertRes = db.prepare(`
       INSERT INTO transactions (user_id, amount, payment_method, screenshot_url, reference_code, status, admin_notes, created_at)
       VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?)
-    `).run(userId, parsedAmount, payment_method, screenshot, ref, now);
+    `).run(userId, parsedAmount, normalizedMethod, screenshot, ref, now);
 
     res.json({
       success: true,
-      message: `Deposit request for ${parsedAmount} ETB submitted via ${payment_method.toUpperCase()}. Admin will verify your uploaded screenshot receipt and credit your balance shortly.`,
+      message: `Deposit request for ${parsedAmount} ETB submitted via ${normalizedMethod.toUpperCase()}. Admin will verify your uploaded screenshot receipt and credit your balance shortly.`,
       transaction_id: Number(insertRes.lastInsertRowid),
       reference_code: ref,
       screenshot_url: screenshot,
@@ -564,13 +628,33 @@ apiRouter.post('/coupon/redeem', async (req: AuthenticatedRequest, res: Response
 });
 
 /** * POST /api/vip/subscribe - Monthly VIP Pass subscription (250 ETB) */
-apiRouter.post('/vip/subscribe', (req: AuthenticatedRequest, res: Response) => {
+apiRouter.post('/vip/subscribe', async (req: AuthenticatedRequest, res: Response) => {
+  // FIX #3a: every other money-moving operation in this system
+  // (purchase_single_movie, purchase_folder, adjust_balance_atomic, etc.)
+  // runs under DB_LOCK with a BEGIN IMMEDIATE transaction so a balance
+  // check-then-update can't race with a concurrent request. This
+  // endpoint did neither: two simultaneous subscribe calls (or a
+  // subscribe racing a purchase) could both read the same starting
+  // balance and both succeed, overdrawing the user. It's now wrapped
+  // the same way as the atomic functions in core.ts.
+  const release = await DB_LOCK.acquire();
   try {
+    db.exec('BEGIN IMMEDIATE;');
+
     const userId = req.currentUserId!;
     const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId) as any;
 
+    // FIX #8: defensive check — authMiddleware always creates a row for
+    // the current user, but a route handling money shouldn't assume that
+    // silently; fail loudly instead of throwing on `user.balance` below.
+    if (!user) {
+      db.exec('ROLLBACK;');
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
     const vipCost = parseFloat(get_setting('vip_monthly_price', '250.0'));
     if (user.balance < vipCost) {
+      db.exec('ROLLBACK;');
       return res.status(400).json({
         success: false,
         message: `Insufficient balance (${user.balance.toFixed(2)} ETB). VIP Monthly Pass costs ${vipCost} ETB. Please deposit funds first.`,
@@ -579,8 +663,15 @@ apiRouter.post('/vip/subscribe', (req: AuthenticatedRequest, res: Response) => {
 
     const newBalance = Math.round((user.balance - vipCost) * 100) / 100;
     const now = new Date();
-    // 30 days VIP
-    const vipUntil = new Date(now.getTime() + 30 * 86400000).toISOString();
+
+    // FIX #3b: extend from the later of "now" or the user's existing
+    // vip_until instead of always resetting to "now + 30 days". Under the
+    // original logic, a user who still had, say, 20 days of VIP left and
+    // resubscribed would have their expiry *replaced* with a fresh 30-day
+    // window — losing time if they'd stacked more than 30 days of passes,
+    // and generally not giving credit for time already paid for.
+    const currentVipUntil = user.vip_until && new Date(user.vip_until) > now ? new Date(user.vip_until) : now;
+    const vipUntil = new Date(currentVipUntil.getTime() + 30 * 86400000).toISOString();
 
     db.prepare(`
       UPDATE users 
@@ -588,16 +679,27 @@ apiRouter.post('/vip/subscribe', (req: AuthenticatedRequest, res: Response) => {
       WHERE user_id = ?
     `).run(newBalance, vipUntil, userId);
 
-    // Record ledger
-    db.prepare(`
-      INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
-      VALUES (?, 'movie_purchase', 'buyer', ?, ?, 0, ?, ?, ?)
-    `).run(now.toISOString(), userId, vipCost, newBalance, `VIP-${Date.now()}-${userId}`, 'Purchased 30-day VIP Cinephile Pass');
+    // FIX #3c: compute one reference id and reuse it for both ledger
+    // legs. The original code called `Date.now()` separately inside each
+    // template string, so the buyer-side and platform-side entries for
+    // the same purchase could end up with two *different* reference
+    // codes, breaking the ability to correlate them as one transaction
+    // (every other ledger-writing function in this codebase computes the
+    // reference id once and reuses it).
+    const refId = `VIP-${Date.now()}-${userId}`;
+    const nowIso = now.toISOString();
 
     db.prepare(`
       INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
-      VALUES (?, 'movie_purchase', 'platform', 0, 0, ?, 0, ?, ?)
-    `).run(now.toISOString(), vipCost, `VIP-${Date.now()}-${userId}`, 'VIP Pass revenue');
+      VALUES (?, 'vip_subscription', 'buyer', ?, ?, 0, ?, ?, ?)
+    `).run(nowIso, userId, vipCost, newBalance, refId, 'Purchased 30-day VIP Cinephile Pass');
+
+    db.prepare(`
+      INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+      VALUES (?, 'vip_subscription', 'platform', 0, 0, ?, 0, ?, ?)
+    `).run(nowIso, vipCost, refId, 'VIP Pass revenue');
+
+    db.exec('COMMIT;');
 
     res.json({
       success: true,
@@ -606,7 +708,11 @@ apiRouter.post('/vip/subscribe', (req: AuthenticatedRequest, res: Response) => {
       new_balance: newBalance,
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, message: err.message });
+    db.exec('ROLLBACK;');
+    console.error('vip/subscribe error:', err);
+    res.status(500).json({ success: false, message: err.message || 'VIP subscription failed' });
+  } finally {
+    release();
   }
 });
 
@@ -683,7 +789,17 @@ apiRouter.post('/partner/movies', (req: AuthenticatedRequest, res: Response) => 
     }
 
     const regPrice = parseFloat(regular_price);
-    const vPrice = vip_price ? parseFloat(vip_price) : Math.round(regPrice * 0.6);
+
+    // FIX #5a: don't use `vip_price ? ... : ...` — an explicit vip_price
+    // of 0 is falsy in JS, so a partner intentionally submitting a free
+    // VIP price would silently be overridden with the 60%-of-regular
+    // default. Check for "was a value actually provided" instead of
+    // truthiness.
+    const parsedVipPrice = vip_price !== undefined && vip_price !== null && vip_price !== ''
+      ? parseFloat(vip_price)
+      : NaN;
+    const vPrice = Number.isFinite(parsedVipPrice) ? parsedVipPrice : Math.round(regPrice * 0.6);
+
     const now = new Date().toISOString();
 
     const insertRes = db.prepare(`
@@ -885,7 +1001,10 @@ apiRouter.get('/admin/deposits/pending', requireAdmin, (req: AuthenticatedReques
 /** * POST /api/admin/deposits/:id/approve */
 apiRouter.post('/admin/deposits/:id/approve', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const id = parseInt(req.params.id, 10);
+    const id = parseIdParam(req.params.id);
+    if (id === null) {
+      return res.status(400).json({ success: false, message: 'Invalid deposit id' });
+    }
     const { admin_notes } = req.body;
 
     const result = await approve_deposit_atomic(id, admin_notes || 'Verified on banking portal');
@@ -902,7 +1021,10 @@ apiRouter.post('/admin/deposits/:id/approve', requireAdmin, async (req: Authenti
 /** * POST /api/admin/deposits/:id/reject */
 apiRouter.post('/admin/deposits/:id/reject', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const id = parseInt(req.params.id, 10);
+    const id = parseIdParam(req.params.id);
+    if (id === null) {
+      return res.status(400).json({ success: false, message: 'Invalid deposit id' });
+    }
     const { admin_notes } = req.body;
 
     const result = await reject_deposit_atomic(id, admin_notes || 'Invalid transaction receipt');
@@ -937,7 +1059,10 @@ apiRouter.get('/admin/payouts/pending', requireAdmin, (req: AuthenticatedRequest
 /** * POST /api/admin/payouts/:id/approve */
 apiRouter.post('/admin/payouts/:id/approve', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const id = parseInt(req.params.id, 10);
+    const id = parseIdParam(req.params.id);
+    if (id === null) {
+      return res.status(400).json({ success: false, message: 'Invalid payout id' });
+    }
     const { admin_notes } = req.body;
 
     const result = await process_payout_atomic(id, 'approve', admin_notes || 'Disbursed via Telebirr Business');
@@ -954,7 +1079,10 @@ apiRouter.post('/admin/payouts/:id/approve', requireAdmin, async (req: Authentic
 /** * POST /api/admin/payouts/:id/reject */
 apiRouter.post('/admin/payouts/:id/reject', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const id = parseInt(req.params.id, 10);
+    const id = parseIdParam(req.params.id);
+    if (id === null) {
+      return res.status(400).json({ success: false, message: 'Invalid payout id' });
+    }
     const { admin_notes } = req.body;
 
     const result = await process_payout_atomic(id, 'reject', admin_notes || 'Account details mismatch');
@@ -988,8 +1116,14 @@ apiRouter.get('/admin/movies/pending', requireAdmin, (req: AuthenticatedRequest,
 /** * POST /api/admin/movies/:id/approve */
 apiRouter.post('/admin/movies/:id/approve', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
   try {
-    const id = parseInt(req.params.id, 10);
-    db.prepare("UPDATE movies SET approval_status = 'active' WHERE id = ?").run(id);
+    const id = parseIdParam(req.params.id);
+    if (id === null) {
+      return res.status(400).json({ success: false, message: 'Invalid movie id' });
+    }
+    const result = db.prepare("UPDATE movies SET approval_status = 'active' WHERE id = ?").run(id);
+    if (result.changes === 0) {
+      return res.status(404).json({ success: false, message: `Movie #${id} not found` });
+    }
     res.json({ success: true, message: `Movie #${id} approved and published to catalog.` });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
@@ -999,8 +1133,14 @@ apiRouter.post('/admin/movies/:id/approve', requireAdmin, (req: AuthenticatedReq
 /** * POST /api/admin/movies/:id/reject */
 apiRouter.post('/admin/movies/:id/reject', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
   try {
-    const id = parseInt(req.params.id, 10);
-    db.prepare("UPDATE movies SET approval_status = 'rejected' WHERE id = ?").run(id);
+    const id = parseIdParam(req.params.id);
+    if (id === null) {
+      return res.status(400).json({ success: false, message: 'Invalid movie id' });
+    }
+    const result = db.prepare("UPDATE movies SET approval_status = 'rejected' WHERE id = ?").run(id);
+    if (result.changes === 0) {
+      return res.status(404).json({ success: false, message: `Movie #${id} not found` });
+    }
     res.json({ success: true, message: `Movie #${id} marked as rejected.` });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
@@ -1026,7 +1166,11 @@ apiRouter.get('/admin/partner/applications', requireAdmin, (req: AuthenticatedRe
 /** * POST /api/admin/partner/applications/:id/approve */
 apiRouter.post('/admin/partner/applications/:id/approve', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
   try {
-    const id = parseInt(req.params.id, 10);
+    const id = parseIdParam(req.params.id);
+    if (id === null) {
+      return res.status(400).json({ success: false, message: 'Invalid application id' });
+    }
+
     const app = db.prepare('SELECT * FROM partner_applications WHERE id = ?').get(id) as any;
     if (!app || app.status !== 'pending') {
       return res.status(400).json({ success: false, message: 'Application not found or already reviewed' });
@@ -1169,6 +1313,14 @@ apiRouter.post('/admin/movies', requireAdmin, (req: AuthenticatedRequest, res: R
     const year = parseInt(release_year, 10) || new Date().getFullYear();
     const rentalHours = parseInt(rental_duration_hours, 10) || 72;
 
+    // FIX #5b: same falsy-zero bug as in /partner/movies, but for
+    // partner_cut_percent — `parseFloat(partner_cut_percent) || 70.0`
+    // meant an admin explicitly setting a 0% partner cut (100% to
+    // platform, a legitimate configuration) would silently be forced
+    // back to the 70% default, because parseFloat('0') === 0 is falsy.
+    const parsedCutPercent = parseFloat(partner_cut_percent);
+    const cutPercent = Number.isFinite(parsedCutPercent) ? parsedCutPercent : 70.0;
+
     const poster = poster_url || 'https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=800&auto=format&fit=crop&q=80';
     const telegramFileId = file_id || `BAACAgQAAxkBAAEPOro_${Date.now()}_oro_rec`;
     const now = new Date().toISOString();
@@ -1200,7 +1352,7 @@ apiRouter.post('/admin/movies', requireAdmin, (req: AuthenticatedRequest, res: R
       rentalHours,
       allow_lifetime ? 1 : 0,
       partner_id ? parseInt(partner_id, 10) : null,
-      parseFloat(partner_cut_percent) || 70.0,
+      cutPercent,
       year,
       quality.trim() || '1080p FHD',
       languages.trim() || 'Afan Oromo',
@@ -1223,7 +1375,11 @@ apiRouter.post('/admin/movies', requireAdmin, (req: AuthenticatedRequest, res: R
 /** * PUT /api/admin/movies/:id - CMS: Update movie details & prices (ETB) */
 apiRouter.put('/admin/movies/:id', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
   try {
-    const movieId = parseInt(req.params.id, 10);
+    const movieId = parseIdParam(req.params.id);
+    if (movieId === null) {
+      return res.status(400).json({ success: false, message: 'Invalid movie id' });
+    }
+
     const existing = db.prepare('SELECT * FROM movies WHERE id = ?').get(movieId) as any;
     if (!existing) {
       return res.status(404).json({ success: false, message: 'Movie not found' });
@@ -1305,7 +1461,11 @@ apiRouter.put('/admin/movies/:id', requireAdmin, (req: AuthenticatedRequest, res
 /** * DELETE /api/admin/movies/:id - CMS: Delete movie from catalog */
 apiRouter.delete('/admin/movies/:id', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
   try {
-    const movieId = parseInt(req.params.id, 10);
+    const movieId = parseIdParam(req.params.id);
+    if (movieId === null) {
+      return res.status(400).json({ success: false, message: 'Invalid movie id' });
+    }
+
     const existing = db.prepare('SELECT * FROM movies WHERE id = ?').get(movieId) as any;
     if (!existing) {
       return res.status(404).json({ success: false, message: 'Movie not found' });
@@ -1359,7 +1519,10 @@ apiRouter.post('/admin/announcements', requireAdmin, (req: AuthenticatedRequest,
 /** * DELETE /api/admin/announcements/:id - CMS: Delete announcement */
 apiRouter.delete('/admin/announcements/:id', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
   try {
-    const id = parseInt(req.params.id, 10);
+    const id = parseIdParam(req.params.id);
+    if (id === null) {
+      return res.status(400).json({ success: false, message: 'Invalid announcement id' });
+    }
     db.prepare('DELETE FROM announcements WHERE id = ?').run(id);
     res.json({ success: true, message: `Announcement #${id} deleted.` });
   } catch (err: any) {
@@ -1423,4 +1586,20 @@ apiRouter.get('/users', (req: AuthenticatedRequest, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
+});
+
+// FIX #6b: router-level error handler. Multer's fileFilter (added above)
+// and its size limit both report failures by calling next(err) rather
+// than resolving normally, so without a handler here those errors would
+// bubble past this router to whatever default error handling the parent
+// app has (typically an HTML error page), instead of the JSON responses
+// every other failure in this API returns.
+apiRouter.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    return next(err);
+  }
+  const isMulterError = err instanceof multer.MulterError;
+  const status = isMulterError ? 400 : 500;
+  console.error('Unhandled router error:', err);
+  res.status(status).json({ success: false, message: err?.message || 'Unexpected server error' });
 });
