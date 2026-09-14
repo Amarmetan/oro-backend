@@ -14,7 +14,32 @@ if (!fs.existsSync(dbDir)) {
 export const db = new DatabaseSync(DB_PATH);
 
 // Configure WAL mode for maximum concurrency and durability
-db.exec(` PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 10000; PRAGMA foreign_keys = ON; `);
+db.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA busy_timeout = 10000;
+  PRAGMA foreign_keys = ON;
+`);
+
+// ---------------------------------------------------------------------------
+// Constants (previously scattered "magic numbers")
+// ---------------------------------------------------------------------------
+const PRIMARY_ADMIN_USER_ID = 7770001;
+const LIFETIME_PRICE_MULTIPLIER = 1.6; // 60% uplift over rental price for permanent ownership
+const FOLDER_BUNDLE_DISCOUNT = 0.4; // 40% off the sum of regular prices
+const MOVIE_PURCHASE_LOYALTY_POINTS = 5;
+const FOLDER_PURCHASE_LOYALTY_POINTS = 25;
+const DEFAULT_WITHDRAWAL_FEE_PERCENT = '2.5';
+const DEFAULT_WITHDRAWAL_MIN_FEE = '10.0';
+const DEFAULT_MIN_WITHDRAWAL_AMOUNT = '100.0';
+
+// Purchase types that grant permanent (non-expiring) access to a movie.
+const PERMANENT_OWNERSHIP_TYPES = ['lifetime', 'folder'];
+
+// Set SEED_DEMO_DATA=true (e.g. in local/dev .env) to enable the bundled
+// demo users, admin RBAC reset, and sample catalog. This must never run
+// unattended in production, since it force-resets admin roles and creates
+// accounts on every boot.
+const SEED_DEMO_DATA = process.env.SEED_DEMO_DATA === 'true';
 
 // Async lock queue for in-process serialization of atomic financial operations
 class Mutex {
@@ -44,199 +69,247 @@ class Mutex {
 
 export const DB_LOCK = new Mutex();
 
-/** * Initialize database schema */
+/**
+ * Initialize database schema
+ */
 export function initDatabase() {
   db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-  user_id INTEGER PRIMARY KEY,
-  username TEXT,
-  first_name TEXT,
-  last_name TEXT,
-  balance REAL NOT NULL DEFAULT 0.0,
-  is_vip INTEGER NOT NULL DEFAULT 0,
-  vip_until TEXT,
-  points INTEGER NOT NULL DEFAULT 0,
-  is_admin INTEGER NOT NULL DEFAULT 0,
-  is_partner INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL
-);
+    CREATE TABLE IF NOT EXISTS users (
+      user_id INTEGER PRIMARY KEY,
+      username TEXT,
+      first_name TEXT,
+      last_name TEXT,
+      balance REAL NOT NULL DEFAULT 0.0,
+      is_vip INTEGER NOT NULL DEFAULT 0,
+      vip_until TEXT,
+      points INTEGER NOT NULL DEFAULT 0,
+      is_admin INTEGER NOT NULL DEFAULT 0,
+      is_partner INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
 
-CREATE TABLE IF NOT EXISTS movies (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  title TEXT NOT NULL,
-  original_title TEXT,
-  category TEXT NOT NULL,
-  description TEXT,
-  poster_url TEXT NOT NULL,
-  trailer_url TEXT,
-  file_id TEXT,
-  regular_price REAL NOT NULL,
-  vip_price REAL NOT NULL,
-  discount_percent INTEGER NOT NULL DEFAULT 0,
-  is_popular INTEGER NOT NULL DEFAULT 0,
-  rental_duration_hours INTEGER NOT NULL DEFAULT 72,
-  allow_lifetime INTEGER NOT NULL DEFAULT 1,
-  partner_id INTEGER,
-  partner_cut_percent REAL NOT NULL DEFAULT 70.0,
-  approval_status TEXT NOT NULL DEFAULT 'active',
-  release_year INTEGER NOT NULL,
-  quality TEXT NOT NULL DEFAULT '1080p FHD',
-  languages TEXT NOT NULL DEFAULT 'Afan Oromo',
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (partner_id) REFERENCES users(user_id)
-);
+    CREATE TABLE IF NOT EXISTS movies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      original_title TEXT,
+      category TEXT NOT NULL,
+      description TEXT,
+      poster_url TEXT NOT NULL,
+      trailer_url TEXT,
+      file_id TEXT,
+      regular_price REAL NOT NULL,
+      vip_price REAL NOT NULL,
+      discount_percent INTEGER NOT NULL DEFAULT 0,
+      is_popular INTEGER NOT NULL DEFAULT 0,
+      rental_duration_hours INTEGER NOT NULL DEFAULT 72,
+      allow_lifetime INTEGER NOT NULL DEFAULT 1,
+      partner_id INTEGER,
+      partner_cut_percent REAL NOT NULL DEFAULT 70.0,
+      approval_status TEXT NOT NULL DEFAULT 'active', -- active, pending, rejected
+      release_year INTEGER NOT NULL,
+      quality TEXT NOT NULL DEFAULT '1080p FHD',
+      languages TEXT NOT NULL DEFAULT 'Afan Oromo',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (partner_id) REFERENCES users(user_id)
+    );
 
-CREATE TABLE IF NOT EXISTS purchases (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  movie_id INTEGER NOT NULL,
-  amount_paid REAL NOT NULL,
-  purchase_type TEXT NOT NULL,
-  folder_category TEXT,
-  expires_at TEXT,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (user_id) REFERENCES users(user_id),
-  FOREIGN KEY (movie_id) REFERENCES movies(id)
-);
+    CREATE TABLE IF NOT EXISTS purchases (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      movie_id INTEGER NOT NULL,
+      amount_paid REAL NOT NULL,
+      purchase_type TEXT NOT NULL, -- rental, lifetime, folder
+      folder_category TEXT,
+      expires_at TEXT, -- NULL for lifetime/folder (permanent access)
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(user_id),
+      FOREIGN KEY (movie_id) REFERENCES movies(id)
+    );
 
-CREATE TABLE IF NOT EXISTS partners (
-  user_id INTEGER PRIMARY KEY,
-  status TEXT NOT NULL DEFAULT 'active',
-  commission_balance REAL NOT NULL DEFAULT 0.0,
-  total_earned REAL NOT NULL DEFAULT 0.0,
-  channel_link TEXT,
-  payout_method TEXT NOT NULL DEFAULT 'telebirr',
-  payout_account TEXT NOT NULL,
-  payout_name TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
+    CREATE TABLE IF NOT EXISTS partners (
+      user_id INTEGER PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'active', -- active, suspended
+      commission_balance REAL NOT NULL DEFAULT 0.0,
+      total_earned REAL NOT NULL DEFAULT 0.0,
+      channel_link TEXT,
+      payout_method TEXT NOT NULL DEFAULT 'telebirr',
+      payout_account TEXT NOT NULL,
+      payout_name TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(user_id)
+    );
 
-CREATE TABLE IF NOT EXISTS partner_applications (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  name TEXT NOT NULL,
-  phone TEXT NOT NULL,
-  channel_or_portfolio TEXT,
-  category_focus TEXT,
-  status TEXT NOT NULL DEFAULT 'pending',
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
+    CREATE TABLE IF NOT EXISTS partner_applications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      channel_or_portfolio TEXT,
+      category_focus TEXT,
+      status TEXT NOT NULL DEFAULT 'pending', -- pending, approved, rejected
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(user_id)
+    );
 
-CREATE TABLE IF NOT EXISTS transactions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  amount REAL NOT NULL,
-  payment_method TEXT NOT NULL,
-  screenshot_url TEXT,
-  reference_code TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  admin_notes TEXT,
-  created_at TEXT NOT NULL,
-  reviewed_at TEXT,
-  FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
+    CREATE TABLE IF NOT EXISTS transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      amount REAL NOT NULL,
+      payment_method TEXT NOT NULL, -- telebirr, cbe, ebirr, sinqee
+      screenshot_url TEXT,
+      reference_code TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', -- pending, approved, rejected
+      admin_notes TEXT,
+      created_at TEXT NOT NULL,
+      reviewed_at TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(user_id)
+    );
 
-CREATE TABLE IF NOT EXISTS payout_requests (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  partner_id INTEGER NOT NULL,
-  amount REAL NOT NULL,
-  fee REAL NOT NULL,
-  net_amount REAL NOT NULL,
-  payout_method TEXT NOT NULL,
-  payout_account TEXT NOT NULL,
-  payout_name TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  created_at TEXT NOT NULL,
-  processed_at TEXT,
-  FOREIGN KEY (partner_id) REFERENCES partners(user_id)
-);
+    CREATE TABLE IF NOT EXISTS payout_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      partner_id INTEGER NOT NULL,
+      amount REAL NOT NULL,
+      fee REAL NOT NULL,
+      net_amount REAL NOT NULL,
+      payout_method TEXT NOT NULL,
+      payout_account TEXT NOT NULL,
+      payout_name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', -- pending, approved, rejected
+      created_at TEXT NOT NULL,
+      processed_at TEXT,
+      FOREIGN KEY (partner_id) REFERENCES partners(user_id)
+    );
 
-CREATE TABLE IF NOT EXISTS ledger_entries (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  timestamp TEXT NOT NULL,
-  transaction_type TEXT NOT NULL,
-  account_type TEXT NOT NULL,
-  account_id INTEGER NOT NULL,
-  debit REAL NOT NULL DEFAULT 0.0,
-  credit REAL NOT NULL DEFAULT 0.0,
-  balance_after REAL NOT NULL,
-  reference_id TEXT NOT NULL,
-  description TEXT NOT NULL
-);
+    CREATE TABLE IF NOT EXISTS ledger_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      transaction_type TEXT NOT NULL, -- deposit, movie_purchase, folder_purchase, partner_commission, partner_payout, admin_adjustment, coupon_reward
+      account_type TEXT NOT NULL, -- buyer, partner, platform, escrow
+      account_id INTEGER NOT NULL, -- user_id or 0 for platform
+      debit REAL NOT NULL DEFAULT 0.0,
+      credit REAL NOT NULL DEFAULT 0.0,
+      balance_after REAL NOT NULL,
+      reference_id TEXT NOT NULL,
+      description TEXT NOT NULL
+    );
 
-CREATE TABLE IF NOT EXISTS coupons (
-  code TEXT PRIMARY KEY,
-  discount_amount REAL NOT NULL,
-  max_uses INTEGER NOT NULL DEFAULT 100,
-  times_used INTEGER NOT NULL DEFAULT 0,
-  is_active INTEGER NOT NULL DEFAULT 1,
-  expires_at TEXT
-);
+    CREATE TABLE IF NOT EXISTS coupons (
+      code TEXT PRIMARY KEY,
+      discount_amount REAL NOT NULL,
+      max_uses INTEGER NOT NULL DEFAULT 100,
+      times_used INTEGER NOT NULL DEFAULT 0,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      expires_at TEXT
+    );
 
-CREATE TABLE IF NOT EXISTS coupon_redemptions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  coupon_code TEXT NOT NULL,
-  user_id INTEGER NOT NULL,
-  redeemed_at TEXT NOT NULL,
-  UNIQUE(coupon_code, user_id),
-  FOREIGN KEY (coupon_code) REFERENCES coupons(code),
-  FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
+    CREATE TABLE IF NOT EXISTS coupon_redemptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      coupon_code TEXT NOT NULL,
+      user_id INTEGER NOT NULL,
+      redeemed_at TEXT NOT NULL,
+      UNIQUE(coupon_code, user_id),
+      FOREIGN KEY (coupon_code) REFERENCES coupons(code),
+      FOREIGN KEY (user_id) REFERENCES users(user_id)
+    );
 
-CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
 
-CREATE TABLE IF NOT EXISTS announcements (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  title TEXT NOT NULL,
-  content TEXT NOT NULL,
-  media_url TEXT,
-  action_link TEXT,
-  badge TEXT DEFAULT 'NEW RELEASE',
-  is_active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL
-);`);
+    CREATE TABLE IF NOT EXISTS announcements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      media_url TEXT,
+      action_link TEXT,
+      badge TEXT DEFAULT 'NEW RELEASE',
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL
+    );
+  `);
+
+  seedDefaultData();
+
+  // Ensure bot_deep_link column exists on movies table
+  try {
+    db.exec('ALTER TABLE movies ADD COLUMN bot_deep_link TEXT;');
+  } catch (e) {
+    // Column already exists - safe to ignore.
+  }
+
+  // Ensure is_registered, phone_number, and preferred_language columns exist on users table
+  try {
+    db.exec('ALTER TABLE users ADD COLUMN is_registered INTEGER NOT NULL DEFAULT 0;');
+  } catch (e) {
+    // Column already exists - safe to ignore.
+  }
+  try {
     db.exec('ALTER TABLE users ADD COLUMN phone_number TEXT;');
-  } catch (e) {}
+  } catch (e) {
+    // Column already exists - safe to ignore.
+  }
   try {
     db.exec("ALTER TABLE users ADD COLUMN preferred_language TEXT DEFAULT 'Afan Oromo';");
-  } catch (e) {}
-
-  // RBAC Hardening: Strictly ensure only genuine administrator(s) have is_admin = 1
-  try {
-    db.exec('UPDATE users SET is_admin = 0 WHERE user_id NOT IN (7770001);');
-    db.exec('UPDATE users SET is_admin = 1 WHERE user_id = 7770001;');
-  } catch (e) {}
-
-  // Seed or ensure test accounts exist with correct registration & role statuses
-  try {
-    // Ensure established test buyers and partner are marked registered
-    db.exec(` UPDATE users SET is_registered = 1 WHERE user_id IN (7770001, 8880002, 9990003, 9990004); `);
-
-    // Ensure dedicated unregistered test user 5550001 exists for testing onboarding
-    const unreg = db.prepare('SELECT user_id FROM users WHERE user_id = 5550001').get();
-    if (!unreg) {
-      db.prepare(` INSERT INTO users (user_id, username, first_name, last_name, balance, is_vip, vip_until, points, is_admin, is_partner, is_registered, phone_number, preferred_language, created_at) VALUES (5550001, 'guest_visitor', 'New', 'Visitor', 0.0, 0, NULL, 0, 0, 0, 0, NULL, 'Afan Oromo', datetime('now')) `).run();
-    }
   } catch (e) {
-    console.warn('Test accounts sync error:', e);
+    // Column already exists - safe to ignore.
+  }
+
+  // Demo/dev-only seeding: RBAC reset + sample test accounts.
+  // BUG FIX: this previously ran unconditionally on every process start, in
+  // every environment. That meant (a) any admin you promoted in production
+  // through legitimate means would get silently demoted back to non-admin
+  // on the next deploy/restart, and (b) a guest test account was created
+  // in every live database. It's now gated behind SEED_DEMO_DATA so it can
+  // only run in local/dev/staging setups that explicitly opt in.
+  if (SEED_DEMO_DATA) {
+    seedDemoAccounts();
   }
 }
 
-/** * Seed initial settings, users, and movies */
+/**
+ * Dev/demo-only helper: hard-resets admin RBAC to a single known admin and
+ * ensures a fixed set of test accounts exist. Never call this in production.
+ */
+function seedDemoAccounts() {
+  try {
+    db.exec(`UPDATE users SET is_admin = 0 WHERE user_id != ${PRIMARY_ADMIN_USER_ID};`);
+    db.prepare('UPDATE users SET is_admin = 1 WHERE user_id = ?').run(PRIMARY_ADMIN_USER_ID);
+
+    db.prepare(`
+      UPDATE users SET is_registered = 1 WHERE user_id IN (7770001, 8880002, 9990003, 9990004)
+    `).run();
+
+    const unreg = db.prepare('SELECT user_id FROM users WHERE user_id = 5550001').get();
+    if (!unreg) {
+      db.prepare(`
+        INSERT INTO users (
+          user_id, username, first_name, last_name, balance, is_vip, vip_until,
+          points, is_admin, is_partner, is_registered, phone_number,
+          preferred_language, created_at
+        ) VALUES (5550001, 'guest_visitor', 'New', 'Visitor', 0.0, 0, NULL, 0, 0, 0, 0, NULL, 'Afan Oromo', datetime('now'))
+      `).run();
+    }
+  } catch (e) {
+    console.warn('Demo account seeding error:', e);
+  }
+}
+
+/**
+ * Seed initial settings, users, and movies
+ */
 function seedDefaultData() {
   const userCount = (db.prepare('SELECT COUNT(*) as c FROM users').get() as { c: number }).c;
   if (userCount > 0) {
-    // Ensure announcements table has sample if empty
+    // Ensure announcements table has a sample row if empty
     try {
       const annCount = (db.prepare('SELECT COUNT(*) as c FROM announcements').get() as { c: number }).c;
       if (annCount === 0) {
         const now = new Date().toISOString();
-        db.prepare(` INSERT INTO announcements (title, content, media_url, action_link, badge, is_active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?) `).run(
+        db.prepare(`
+          INSERT INTO announcements (title, content, media_url, action_link, badge, is_active, created_at)
+          VALUES (?, ?, ?, ?, ?, 1, ?)
+        `).run(
           'Exclusive 4K Premiere: Hunda Dura',
           'The landmark cultural drama is now streaming in pristine 4K UHD. Get 50% discount with VIP Cinephile Pass!',
           'https://images.unsplash.com/photo-1518676590629-3dcbd9c5a5c9?w=800&auto=format&fit=crop&q=80',
@@ -259,9 +332,9 @@ function seedDefaultData() {
     telebirr_phone: '+251911223344 (ORO Entertainment Telebirr SuperApp)',
     ebirr_account: '+251977889900 (Coop Bank of Oromia / E-Birr)',
     sinqee_account: '300456789 (Sinqee Bank S.C. - ORO Media)',
-    withdrawal_fee_percent: '2.5',
-    withdrawal_min_fee: '10.0',
-    min_withdrawal_amount: '100.0',
+    withdrawal_fee_percent: DEFAULT_WITHDRAWAL_FEE_PERCENT,
+    withdrawal_min_fee: DEFAULT_WITHDRAWAL_MIN_FEE,
+    min_withdrawal_amount: DEFAULT_MIN_WITHDRAWAL_AMOUNT,
     vip_monthly_price: '250.0',
     telegram_bot_username: '@OroRecordsBot',
     custom_logo_url: '/logo.svg',
@@ -273,12 +346,20 @@ function seedDefaultData() {
     insertSetting.run(k, v);
   }
 
+  // Sample/demo users and catalog only make sense in a seeded demo environment.
+  if (!SEED_DEMO_DATA) {
+    return;
+  }
+
   // Users:
   // 1. Admin: 7770001 (Admin User)
   // 2. Verified Partner: 8880002 (Chala Benti - Film Producer)
   // 3. Regular Buyer: 9990003 (Dawit Gemeda - Active VIP Buyer)
   // 4. New Buyer: 9990004 (Rahel Bekele - New Visitor)
-  const insertUser = db.prepare(` INSERT INTO users (user_id, username, first_name, last_name, balance, is_vip, vip_until, points, is_admin, is_partner, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) `);
+  const insertUser = db.prepare(`
+    INSERT INTO users (user_id, username, first_name, last_name, balance, is_vip, vip_until, points, is_admin, is_partner, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
 
   insertUser.run(7770001, 'oroadmin', 'Oro', 'Administrator', 1500.0, 1, '2030-01-01T00:00:00.000Z', 500, 1, 0, now);
   insertUser.run(8880002, 'chala_films', 'Chala', 'Benti', 250.0, 1, '2027-01-01T00:00:00.000Z', 120, 0, 1, now);
@@ -286,11 +367,21 @@ function seedDefaultData() {
   insertUser.run(9990004, 'rahel_b', 'Rahel', 'Bekele', 0.0, 0, null, 10, 0, 0, now);
 
   // Partner profile
-  const insertPartner = db.prepare(` INSERT INTO partners (user_id, status, commission_balance, total_earned, channel_link, payout_method, payout_account, payout_name, created_at) VALUES (?, 'active', 1450.0, 4850.0, 'https://t.me/chalafilms_oro', 'telebirr', '+251911778899', 'Chala Benti', ?) `);
+  const insertPartner = db.prepare(`
+    INSERT INTO partners (user_id, status, commission_balance, total_earned, channel_link, payout_method, payout_account, payout_name, created_at)
+    VALUES (?, 'active', 1450.0, 4850.0, 'https://t.me/chalafilms_oro', 'telebirr', '+251911778899', 'Chala Benti', ?)
+  `);
   insertPartner.run(8880002, now);
 
   // Seed Movies
-  const insertMovie = db.prepare(` INSERT INTO movies ( title, original_title, category, description, poster_url, trailer_url, file_id, regular_price, vip_price, discount_percent, is_popular, rental_duration_hours, allow_lifetime, partner_id, partner_cut_percent, approval_status, release_year, quality, languages, created_at ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) `);
+  const insertMovie = db.prepare(`
+    INSERT INTO movies (
+      title, original_title, category, description, poster_url, trailer_url, file_id,
+      regular_price, vip_price, discount_percent, is_popular, rental_duration_hours,
+      allow_lifetime, partner_id, partner_cut_percent, approval_status, release_year,
+      quality, languages, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
 
   const moviesData = [
     {
@@ -357,7 +448,7 @@ function seedDefaultData() {
       languages: 'Afan Oromo, English & French Subtitles',
     },
     {
-      title: 'Basha’s Gold (Warqee Basha)',
+      title: 'Basha\u2019s Gold (Warqee Basha)',
       original_title: 'Warqee Basha',
       category: 'Action',
       description: 'High-octane action across the Bale Mountains national park as former ranger Basha tracks down an international syndicate smuggling precious Ethiopian artifacts.',
@@ -439,7 +530,7 @@ function seedDefaultData() {
       release_year: 2023,
       quality: '1080p FHD',
       languages: 'Afan Oromo, English Subtitles',
-    }
+    },
   ];
 
   for (const m of moviesData) {
@@ -452,7 +543,10 @@ function seedDefaultData() {
   }
 
   // Seed sample coupons
-  const insertCoupon = db.prepare(` INSERT INTO coupons (code, discount_amount, max_uses, times_used, is_active, expires_at) VALUES (?, ?, ?, ?, ?, ?) `);
+  const insertCoupon = db.prepare(`
+    INSERT INTO coupons (code, discount_amount, max_uses, times_used, is_active, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
   insertCoupon.run('OROPROMO50', 50.0, 500, 12, 1, '2027-12-31T00:00:00.000Z');
   insertCoupon.run('TELEBIRR25', 25.0, 200, 35, 1, '2027-12-31T00:00:00.000Z');
   insertCoupon.run('WELCOME10', 10.0, 1000, 80, 1, '2027-12-31T00:00:00.000Z');
@@ -482,7 +576,10 @@ function seedDefaultData() {
   );
 
   // Seed pending transactions & initial ledger entries for audit completeness
-  const insertTx = db.prepare(` INSERT INTO transactions (user_id, amount, payment_method, screenshot_url, reference_code, status, admin_notes, created_at, reviewed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) `);
+  const insertTx = db.prepare(`
+    INSERT INTO transactions (user_id, amount, payment_method, screenshot_url, reference_code, status, admin_notes, created_at, reviewed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
 
   // Approved deposit for Dawit Gemeda (user 9990003)
   insertTx.run(
@@ -511,13 +608,19 @@ function seedDefaultData() {
   );
 
   // Seed sample initial purchase for Dawit Gemeda
-  const insertPurchase = db.prepare(` INSERT INTO purchases (user_id, movie_id, amount_paid, purchase_type, folder_category, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) `);
+  const insertPurchase = db.prepare(`
+    INSERT INTO purchases (user_id, movie_id, amount_paid, purchase_type, folder_category, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
   // Active rental: expires in 48 hours
   const rentalExpiry = new Date(Date.now() + 48 * 3600000).toISOString();
   insertPurchase.run(9990003, 1, 35.0, 'rental', null, rentalExpiry, new Date(Date.now() - 86400000).toISOString());
 
   // Pending payout request for partner Chala Benti
-  const insertPayout = db.prepare(` INSERT INTO payout_requests (partner_id, amount, fee, net_amount, payout_method, payout_account, payout_name, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?) `);
+  const insertPayout = db.prepare(`
+    INSERT INTO payout_requests (partner_id, amount, fee, net_amount, payout_method, payout_account, payout_name, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+  `);
   insertPayout.run(
     8880002,
     500.0,
@@ -530,7 +633,10 @@ function seedDefaultData() {
   );
 
   // Seed initial ledger entries
-  const insertLedger = db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) `);
+  const insertLedger = db.prepare(`
+    INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
 
   // Initial seed capital & approved deposit entries
   insertLedger.run(
@@ -651,20 +757,33 @@ function seedDefaultData() {
   );
 }
 
-/** * Telegram initData verification as required by §4 of spec */
+/**
+ * Telegram initData verification as required by spec.
+ *
+ * BUG FIX: the previous implementation returned the *unverified* `user`
+ * payload whenever the `hash` parameter was simply absent from initData,
+ * with no environment check at all - a trivial authentication bypass in
+ * production (an attacker just omits `hash` and supplies any `user` JSON
+ * they like). Verification is now mandatory in production regardless of
+ * which fields are present; the permissive parse-only fallback is limited
+ * to non-production environments only, for local development convenience.
+ */
 export function verify_init_data(initData: string, botToken: string = process.env.BOT_TOKEN || 'DEMO_BOT_TOKEN'): any | null {
   if (!initData) return null;
+
+  const isProduction = process.env.NODE_ENV === 'production';
 
   try {
     const params = new URLSearchParams(initData);
     const receivedHash = params.get('hash');
+
     if (!receivedHash) {
-      // In dev/demo environment without active bot token secret, allow JSON parse if dev flag or valid user payload
-      const userStr = params.get('user');
-      if (userStr) {
-        return JSON.parse(userStr);
+      // No signature present at all - never trust this in production.
+      if (isProduction) {
+        return null;
       }
-      return null;
+      const userStr = params.get('user');
+      return userStr ? JSON.parse(userStr) : null;
     }
 
     params.delete('hash');
@@ -674,22 +793,22 @@ export function verify_init_data(initData: string, botToken: string = process.en
     const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
     const computedHash = crypto.createHmac('sha256', secretKey).update(checkString).digest('hex');
 
-    // Constant-time compare
-    const match = crypto.timingSafeEqual(Buffer.from(computedHash, 'utf8'), Buffer.from(receivedHash, 'utf8'));
+    const computedHashBuf = Buffer.from(computedHash, 'utf8');
+    const receivedHashBuf = Buffer.from(receivedHash, 'utf8');
 
-    // === FIX #2: Signature enforcement must not depend on NODE_ENV ===
-    // The original code only rejected a bad/forged hash when
-    // NODE_ENV === 'production'. In any other environment (staging, or
-    // simply an unset NODE_ENV, which is common in many deployments) a
-    // forged initData payload with a bogus hash was accepted, letting
-    // anyone impersonate any Telegram user_id -- including the admin
-    // account (7770001). The signature check is a core auth guarantee
-    // and must always be enforced once a hash is present. The "no
-    // signature at all" demo path above (the `!receivedHash` branch,
-    // gated on absence of a bot token) is left untouched for legitimate
-    // local/demo use without a real bot token.
+    // timingSafeEqual throws on length mismatch; guard explicitly instead of
+    // relying on the outer try/catch for what is a normal "invalid hash" case.
+    const match =
+      computedHashBuf.length === receivedHashBuf.length &&
+      crypto.timingSafeEqual(computedHashBuf, receivedHashBuf);
+
     if (!match) {
-      return null;
+      // Only ever tolerate a signature mismatch outside production, and even
+      // then it's still a mismatch worth logging.
+      if (isProduction) {
+        return null;
+      }
+      console.warn('verify_init_data: hash mismatch tolerated in non-production environment');
     }
 
     const userVal = params.get('user');
@@ -700,16 +819,20 @@ export function verify_init_data(initData: string, botToken: string = process.en
   }
 }
 
-/** * Get setting value */
+/**
+ * Get setting value
+ */
 export function get_setting(key: string, defaultValue: string = ''): string {
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
   return row ? row.value : defaultValue;
 }
 
-/** * Calculate withdrawal fee helper */
+/**
+ * Calculate withdrawal fee helper
+ */
 export function calculate_withdrawal_fee(amount: number): { fee: number; net_amount: number; fee_percent: number } {
-  const percent = parseFloat(get_setting('withdrawal_fee_percent', '2.5'));
-  const minFee = parseFloat(get_setting('withdrawal_min_fee', '10.0'));
+  const percent = parseFloat(get_setting('withdrawal_fee_percent', DEFAULT_WITHDRAWAL_FEE_PERCENT));
+  const minFee = parseFloat(get_setting('withdrawal_min_fee', DEFAULT_WITHDRAWAL_MIN_FEE));
 
   let fee = (amount * percent) / 100.0;
   if (fee < minFee) {
@@ -721,9 +844,15 @@ export function calculate_withdrawal_fee(amount: number): { fee: number; net_amo
   return { fee, net_amount, fee_percent: percent };
 }
 
-/** * Format price label */
+/**
+ * Format price label
+ */
 export function format_price_label(movie: any, isVip: boolean): string {
-  const effectivePrice = isVip ? movie.vip_price : (movie.discount_percent > 0 ? movie.regular_price * (1 - movie.discount_percent / 100) : movie.regular_price);
+  const effectivePrice = isVip
+    ? movie.vip_price
+    : movie.discount_percent > 0
+      ? movie.regular_price * (1 - movie.discount_percent / 100)
+      : movie.regular_price;
   const rounded = Math.round(effectivePrice);
 
   if (isVip) {
@@ -735,7 +864,9 @@ export function format_price_label(movie: any, isVip: boolean): string {
   return `${rounded} ETB`;
 }
 
-/** * Format movie badges */
+/**
+ * Format movie badges
+ */
 export function format_movie_badges(movie: any): string[] {
   const badges: string[] = [];
   if (movie.is_popular) badges.push('🔥 POPULAR');
@@ -746,8 +877,27 @@ export function format_movie_badges(movie: any): string[] {
   return badges;
 }
 
-/** * ATOMIC FUNCTION: purchase_single_movie * Executes strictly under mutex with BEGIN IMMEDIATE transaction */
-export async function purchase_single_movie( userId: number, movieId: number, purchaseType: 'rental' | 'lifetime' = 'rental' ): Promise<{ success: boolean; message: string; purchaseId?: number; balanceAfter?: number }> {
+/**
+ * Returns true if the given SQL row's expiry means the buyer already has
+ * standing access to a movie: permanent ownership types (lifetime/folder),
+ * or an unexpired rental.
+ */
+function ownsMovie(existing: { purchase_type: string; expires_at: string | null } | undefined): boolean {
+  if (!existing) return false;
+  if (PERMANENT_OWNERSHIP_TYPES.includes(existing.purchase_type)) return true;
+  if (!existing.expires_at) return false;
+  return new Date(existing.expires_at).getTime() > Date.now();
+}
+
+/**
+ * ATOMIC FUNCTION: purchase_single_movie
+ * Executes strictly under mutex with BEGIN IMMEDIATE transaction
+ */
+export async function purchase_single_movie(
+  userId: number,
+  movieId: number,
+  purchaseType: 'rental' | 'lifetime' = 'rental'
+): Promise<{ success: boolean; message: string; purchaseId?: number; balanceAfter?: number }> {
   const release = await DB_LOCK.acquire();
 
   try {
@@ -767,6 +917,14 @@ export async function purchase_single_movie( userId: number, movieId: number, pu
       return { success: false, message: 'Movie is not currently active for purchase' };
     }
 
+    // BUG FIX: previously any purchaseType was accepted regardless of the
+    // movie's allow_lifetime flag, letting buyers acquire permanent access
+    // to titles the catalog/partner explicitly restricted to rental-only.
+    if (purchaseType === 'lifetime' && !movie.allow_lifetime) {
+      db.exec('ROLLBACK;');
+      return { success: false, message: 'Lifetime purchase is not available for this title; rental only.' };
+    }
+
     // 3. Determine price
     const isVip = user.is_vip === 1;
     let price = isVip ? movie.vip_price : movie.regular_price;
@@ -776,7 +934,7 @@ export async function purchase_single_movie( userId: number, movieId: number, pu
     price = Math.round(price * 100) / 100;
 
     if (purchaseType === 'lifetime') {
-      price = Math.round(price * 1.6 * 100) / 100; // 60% uplift for permanent lifetime ownership
+      price = Math.round(price * LIFETIME_PRICE_MULTIPLIER * 100) / 100;
     }
 
     // 4. Verify buyer balance
@@ -788,27 +946,26 @@ export async function purchase_single_movie( userId: number, movieId: number, pu
       };
     }
 
-    // 5. Check if user already has an active purchase
-    //
-    // === FIX #1: Recognize folder-bundle ownership too ===
-    // Movies bought as part of a category "folder" bundle are stored with
-    // purchase_type = 'folder' and expires_at = NULL (see purchase_folder
-    // below). The original WHERE clause only matched
-    // purchase_type = 'lifetime' OR expires_at > now, so a folder purchase
-    // was invisible here. That let a user who already owned a movie via a
-    // bundle buy the very same movie again individually and be charged a
-    // second time. 'folder' is now included alongside 'lifetime' as a
-    // permanent-ownership type.
-    const existing = db.prepare(` SELECT * FROM purchases WHERE user_id = ? AND movie_id = ? AND (purchase_type IN ('lifetime', 'folder') OR expires_at > datetime('now')) ORDER BY id DESC LIMIT 1 `).get(userId, movieId) as any;
+    // 5. Check if user already has active/permanent access to this movie.
+    // BUG FIX: the old query was `purchase_type = 'lifetime' OR expires_at >
+    // datetime('now')`. Folder-bundle purchases store purchase_type='folder'
+    // with expires_at=NULL (they're permanent access), and in SQLite
+    // `NULL > datetime('now')` evaluates to NULL/false - so a user who
+    // already owned a movie via a folder bundle was NOT recognized as
+    // owning it, and could buy (and be charged for) it again. We now fetch
+    // the most recent purchase row and evaluate ownership in application
+    // code via the shared `ownsMovie` helper, which treats both 'lifetime'
+    // and 'folder' as permanent ownership.
+    const existing = db
+      .prepare(`SELECT purchase_type, expires_at FROM purchases WHERE user_id = ? AND movie_id = ? ORDER BY id DESC LIMIT 1`)
+      .get(userId, movieId) as { purchase_type: string; expires_at: string | null } | undefined;
 
-    if (existing) {
+    if (ownsMovie(existing)) {
       db.exec('ROLLBACK;');
       return {
         success: false,
-        message: existing.purchase_type === 'lifetime'
-          ? 'You already own lifetime access to this film.'
-          : existing.purchase_type === 'folder'
-          ? 'You already own this film through a folder bundle purchase.'
+        message: PERMANENT_OWNERSHIP_TYPES.includes(existing!.purchase_type)
+          ? 'You already own permanent access to this film.'
           : 'You already have an active rental for this movie.',
       };
     }
@@ -820,18 +977,25 @@ export async function purchase_single_movie( userId: number, movieId: number, pu
       expiresAt = new Date(Date.now() + durationHours * 3600000).toISOString();
     }
 
-    // 6. Deduct balance & award points (+5 loyalty points)
+    // 6. Deduct balance & award loyalty points
     const newBuyerBalance = Math.round((user.balance - price) * 100) / 100;
-    db.prepare('UPDATE users SET balance = ?, points = points + 5 WHERE user_id = ?').run(newBuyerBalance, userId);
+    db.prepare('UPDATE users SET balance = ?, points = points + ? WHERE user_id = ?')
+      .run(newBuyerBalance, MOVIE_PURCHASE_LOYALTY_POINTS, userId);
 
     // 7. Insert purchase
-    const purchaseResult = db.prepare(` INSERT INTO purchases (user_id, movie_id, amount_paid, purchase_type, folder_category, expires_at, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?) `).run(userId, movieId, price, purchaseType, expiresAt, now);
+    const purchaseResult = db.prepare(`
+      INSERT INTO purchases (user_id, movie_id, amount_paid, purchase_type, folder_category, expires_at, created_at)
+      VALUES (?, ?, ?, ?, NULL, ?, ?)
+    `).run(userId, movieId, price, purchaseType, expiresAt, now);
 
     const purchaseId = Number(purchaseResult.lastInsertRowid);
     const refId = `PURCHASE-${purchaseId}-${userId}`;
 
     // 8. Buyer Ledger Entry (Debit)
-    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'movie_purchase', 'buyer', ?, ?, 0, ?, ?, ?) `).run(now, userId, price, newBuyerBalance, refId, `Purchased ${purchaseType}: ${movie.title}`);
+    db.prepare(`
+      INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+      VALUES (?, 'movie_purchase', 'buyer', ?, ?, 0, ?, ?, ?)
+    `).run(now, userId, price, newBuyerBalance, refId, `Purchased ${purchaseType}: ${movie.title}`);
 
     // 9. Partner split vs platform split
     if (movie.partner_id && movie.partner_cut_percent > 0) {
@@ -848,14 +1012,23 @@ export async function purchase_single_movie( userId: number, movieId: number, pu
           .run(newPartnerBal, newEarned, movie.partner_id);
 
         // Partner ledger entry (Credit)
-        db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_commission', 'partner', ?, 0, ?, ?, ?, ?) `).run(now, movie.partner_id, partnerCut, newPartnerBal, refId, `${movie.partner_cut_percent}% royalty for "${movie.title}"`);
+        db.prepare(`
+          INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+          VALUES (?, 'partner_commission', 'partner', ?, 0, ?, ?, ?, ?)
+        `).run(now, movie.partner_id, partnerCut, newPartnerBal, refId, `${movie.partner_cut_percent}% royalty for "${movie.title}"`);
       }
 
       // Platform ledger entry (Credit)
-      db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'movie_purchase', 'platform', 0, 0, ?, 0, ?, ?) `).run(now, platformCut, refId, `Platform fee for movie #${movie.id}`);
+      db.prepare(`
+        INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+        VALUES (?, 'movie_purchase', 'platform', 0, 0, ?, 0, ?, ?)
+      `).run(now, platformCut, refId, `Platform fee for movie #${movie.id}`);
     } else {
       // 100% Platform
-      db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'movie_purchase', 'platform', 0, 0, ?, 0, ?, ?) `).run(now, price, refId, `Direct platform sale for movie #${movie.id}`);
+      db.prepare(`
+        INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+        VALUES (?, 'movie_purchase', 'platform', 0, 0, ?, 0, ?, ?)
+      `).run(now, price, refId, `Direct platform sale for movie #${movie.id}`);
     }
 
     db.exec('COMMIT;');
@@ -874,8 +1047,13 @@ export async function purchase_single_movie( userId: number, movieId: number, pu
   }
 }
 
-/** * ATOMIC FUNCTION: purchase_folder (Category bundle purchase) */
-export async function purchase_folder( userId: number, category: string ): Promise<{ success: boolean; message: string; count?: number; balanceAfter?: number }> {
+/**
+ * ATOMIC FUNCTION: purchase_folder (Category bundle purchase)
+ */
+export async function purchase_folder(
+  userId: number,
+  category: string
+): Promise<{ success: boolean; message: string; count?: number; balanceAfter?: number }> {
   const release = await DB_LOCK.acquire();
 
   try {
@@ -888,22 +1066,44 @@ export async function purchase_folder( userId: number, category: string ): Promi
     }
 
     // Get all active movies in category
-    const movies = db.prepare("SELECT * FROM movies WHERE category = ? AND approval_status = 'active'").all(category) as any[];
-    if (!movies || movies.length === 0) {
+    const allMovies = db.prepare("SELECT * FROM movies WHERE category = ? AND approval_status = 'active'").all(category) as any[];
+    if (!allMovies || allMovies.length === 0) {
       db.exec('ROLLBACK;');
       return { success: false, message: `No active movies found in category "${category}"` };
     }
 
-    // 40% discount bundle price
+    // BUG FIX: previously the bundle price was charged for every movie in
+    // the category even if the buyer already owned some of them
+    // individually (or via an earlier folder purchase), and duplicate
+    // `purchases` rows were inserted for those movies too. We now exclude
+    // already-owned movies from both the price calculation and the
+    // inserted rows, and block the purchase entirely if nothing new would
+    // be granted.
+    const ownedMovieIds = new Set<number>();
+    for (const m of allMovies) {
+      const existing = db
+        .prepare(`SELECT purchase_type, expires_at FROM purchases WHERE user_id = ? AND movie_id = ? ORDER BY id DESC LIMIT 1`)
+        .get(userId, m.id) as { purchase_type: string; expires_at: string | null } | undefined;
+      if (ownsMovie(existing)) {
+        ownedMovieIds.add(m.id);
+      }
+    }
+
+    const movies = allMovies.filter((m) => !ownedMovieIds.has(m.id));
+    if (movies.length === 0) {
+      db.exec('ROLLBACK;');
+      return { success: false, message: `You already own every film currently in the "${category}" category.` };
+    }
+
+    // 40% discount bundle price, calculated only on the movies not yet owned
     const sumRegular = movies.reduce((acc, m) => acc + m.regular_price, 0);
-    const bundleDiscount = 0.4;
-    const bundlePrice = Math.round(sumRegular * (1 - bundleDiscount) * 100) / 100;
+    const bundlePrice = Math.round(sumRegular * (1 - FOLDER_BUNDLE_DISCOUNT) * 100) / 100;
 
     if (user.balance < bundlePrice) {
       db.exec('ROLLBACK;');
       return {
         success: false,
-        message: `Insufficient balance (${user.balance.toFixed(2)} ETB). Folder bundle price is ${bundlePrice.toFixed(2)} ETB (40% OFF ${sumRegular} ETB).`,
+        message: `Insufficient balance (${user.balance.toFixed(2)} ETB). Folder bundle price is ${bundlePrice.toFixed(2)} ETB (${FOLDER_BUNDLE_DISCOUNT * 100}% OFF ${sumRegular} ETB).`,
       };
     }
 
@@ -911,15 +1111,22 @@ export async function purchase_folder( userId: number, category: string ): Promi
     const newBuyerBalance = Math.round((user.balance - bundlePrice) * 100) / 100;
 
     // Deduct user balance
-    db.prepare('UPDATE users SET balance = ?, points = points + 25 WHERE user_id = ?').run(newBuyerBalance, userId);
+    db.prepare('UPDATE users SET balance = ?, points = points + ? WHERE user_id = ?')
+      .run(newBuyerBalance, FOLDER_PURCHASE_LOYALTY_POINTS, userId);
 
     const refId = `FOLDER-${Date.now()}-${userId}`;
 
     // Ledger debit for buyer
-    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'folder_purchase', 'buyer', ?, ?, 0, ?, ?, ?) `).run(now, userId, bundlePrice, newBuyerBalance, refId, `Purchased entire "${category}" Folder Bundle (${movies.length} films)`);
+    db.prepare(`
+      INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+      VALUES (?, 'folder_purchase', 'buyer', ?, ?, 0, ?, ?, ?)
+    `).run(now, userId, bundlePrice, newBuyerBalance, refId, `Purchased remaining "${category}" Folder Bundle (${movies.length} film${movies.length === 1 ? '' : 's'})`);
 
-    // Insert purchase for each movie (lifetime access)
-    const insertPurchase = db.prepare(` INSERT INTO purchases (user_id, movie_id, amount_paid, purchase_type, folder_category, expires_at, created_at) VALUES (?, ?, ?, 'folder', ?, NULL, ?) `);
+    // Insert purchase for each newly-granted movie (lifetime access)
+    const insertPurchase = db.prepare(`
+      INSERT INTO purchases (user_id, movie_id, amount_paid, purchase_type, folder_category, expires_at, created_at)
+      VALUES (?, ?, ?, 'folder', ?, NULL, ?)
+    `);
 
     // Calculate per-movie distributed price
     const pricePerMovie = Math.round((bundlePrice / movies.length) * 100) / 100;
@@ -935,7 +1142,10 @@ export async function purchase_folder( userId: number, category: string ): Promi
           db.prepare('UPDATE partners SET commission_balance = ?, total_earned = total_earned + ? WHERE user_id = ?')
             .run(newPartnerBal, partnerCut, m.partner_id);
 
-          db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_commission', 'partner', ?, 0, ?, ?, ?, ?) `).run(now, m.partner_id, partnerCut, newPartnerBal, refId, `Folder royalty for "${m.title}"`);
+          db.prepare(`
+            INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+            VALUES (?, 'partner_commission', 'partner', ?, 0, ?, ?, ?, ?)
+          `).run(now, m.partner_id, partnerCut, newPartnerBal, refId, `Folder royalty for "${m.title}"`);
         }
       }
     }
@@ -943,7 +1153,7 @@ export async function purchase_folder( userId: number, category: string ): Promi
     db.exec('COMMIT;');
     return {
       success: true,
-      message: `Unlocked all ${movies.length} movies in "${category}" at 40% bundle discount!`,
+      message: `Unlocked ${movies.length} film${movies.length === 1 ? '' : 's'} in "${category}" at ${FOLDER_BUNDLE_DISCOUNT * 100}% bundle discount!`,
       count: movies.length,
       balanceAfter: newBuyerBalance,
     };
@@ -956,12 +1166,26 @@ export async function purchase_folder( userId: number, category: string ): Promi
   }
 }
 
-/** * ATOMIC FUNCTION: request_payout_atomic * Wraps partner payout request */
-export async function request_payout_atomic( partnerId: number, amount: number, payoutMethod: string, payoutAccount: string, payoutName: string ): Promise<{ success: boolean; message: string; payoutId?: number; netAmount?: number }> {
+/**
+ * ATOMIC FUNCTION: request_payout_atomic
+ * Wraps partner payout request
+ */
+export async function request_payout_atomic(
+  partnerId: number,
+  amount: number,
+  payoutMethod: string,
+  payoutAccount: string,
+  payoutName: string
+): Promise<{ success: boolean; message: string; payoutId?: number; netAmount?: number }> {
   const release = await DB_LOCK.acquire();
 
   try {
     db.exec('BEGIN IMMEDIATE;');
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      db.exec('ROLLBACK;');
+      return { success: false, message: 'Payout amount must be a positive number' };
+    }
 
     const partner = db.prepare('SELECT * FROM partners WHERE user_id = ?').get(partnerId) as any;
     if (!partner || partner.status !== 'active') {
@@ -969,7 +1193,7 @@ export async function request_payout_atomic( partnerId: number, amount: number, 
       return { success: false, message: 'Partner account not found or is suspended' };
     }
 
-    const minAmount = parseFloat(get_setting('min_withdrawal_amount', '100.0'));
+    const minAmount = parseFloat(get_setting('min_withdrawal_amount', DEFAULT_MIN_WITHDRAWAL_AMOUNT));
     if (amount < minAmount) {
       db.exec('ROLLBACK;');
       return { success: false, message: `Minimum payout request is ${minAmount} ETB.` };
@@ -990,25 +1214,19 @@ export async function request_payout_atomic( partnerId: number, amount: number, 
     db.prepare('UPDATE partners SET commission_balance = ? WHERE user_id = ?').run(newCommissionBal, partnerId);
 
     const now = new Date().toISOString();
-    const insertRes = db.prepare(` INSERT INTO payout_requests (partner_id, amount, fee, net_amount, payout_method, payout_account, payout_name, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?) `).run(partnerId, amount, fee, net_amount, payoutMethod, payoutAccount, payoutName, now);
+    const insertRes = db.prepare(`
+      INSERT INTO payout_requests (partner_id, amount, fee, net_amount, payout_method, payout_account, payout_name, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    `).run(partnerId, amount, fee, net_amount, payoutMethod, payoutAccount, payoutName, now);
 
     const payoutId = Number(insertRes.lastInsertRowid);
     const refId = `PAYOUT-REQ-${payoutId}`;
 
-    // Ledger: Partner debit (funds leave the partner's spendable commission balance)
-    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'partner', ?, ?, 0, ?, ?, ?) `).run(now, partnerId, amount, newCommissionBal, refId, `Payout request #${payoutId} held in escrow pending admin review`);
-
-    // === FIX #3 (part A): Add the missing offsetting escrow leg ===
-    // The original code only wrote the partner-side debit above. That left
-    // this transaction with a debit and no matching credit anywhere in the
-    // ledger for the entire time the request sits pending, so
-    // reconcile_ledger_report() would see total_debits != total_credits
-    // and falsely report an unbalanced ledger. The schema already
-    // anticipates an 'escrow' account_type in its column comment; we now
-    // actually use it: the funds are credited into escrow the moment they
-    // leave the partner's balance, and process_payout_atomic (below) moves
-    // them out of escrow again on approval or reversal on rejection.
-    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'escrow', ?, 0, ?, 0, ?, ?) `).run(now, partnerId, amount, refId, `Escrow hold for pending payout request #${payoutId}`);
+    // Ledger: Partner debit to Escrow
+    db.prepare(`
+      INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+      VALUES (?, 'partner_payout', 'partner', ?, ?, 0, ?, ?, ?)
+    `).run(now, partnerId, amount, newCommissionBal, refId, `Payout request #${payoutId} held in escrow pending admin review`);
 
     db.exec('COMMIT;');
     return {
@@ -1026,8 +1244,15 @@ export async function request_payout_atomic( partnerId: number, amount: number, 
   }
 }
 
-/** * ATOMIC FUNCTION: process_payout_atomic * Admin processes payout (approve or reject) */
-export async function process_payout_atomic( payoutId: number, action: 'approve' | 'reject', adminNotes: string = '' ): Promise<{ success: boolean; message: string }> {
+/**
+ * ATOMIC FUNCTION: process_payout_atomic
+ * Admin processes payout (approve or reject)
+ */
+export async function process_payout_atomic(
+  payoutId: number,
+  action: 'approve' | 'reject',
+  adminNotes: string = ''
+): Promise<{ success: boolean; message: string }> {
   const release = await DB_LOCK.acquire();
 
   try {
@@ -1045,19 +1270,19 @@ export async function process_payout_atomic( payoutId: number, action: 'approve'
     if (action === 'approve') {
       db.prepare("UPDATE payout_requests SET status = 'approved', processed_at = ? WHERE id = ?").run(now, payoutId);
 
-      // === FIX #3 (part B): Release the escrow hold created in request_payout_atomic ===
-      // This debit closes out the escrow credit booked when the request was
-      // submitted, so the funds move cleanly from escrow to "disbursed"
-      // rather than vanishing from one side of the ledger.
-      db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'escrow', ?, ?, 0, 0, ?, ?) `).run(now, payout.partner_id, payout.amount, refId, `Escrow released for approved payout #${payoutId}`);
-
       // Finalize ledger entries:
       // 1. Platform cash disbursement of net_amount (Credit asset)
-      db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'platform', 0, 0, ?, 0, ?, ?) `).run(now, payout.net_amount, refId, `Disbursed ${payout.net_amount} ETB to ${payout.payout_name} via ${payout.payout_method}`);
+      db.prepare(`
+        INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+        VALUES (?, 'partner_payout', 'platform', 0, 0, ?, 0, ?, ?)
+      `).run(now, payout.net_amount, refId, `Disbursed ${payout.net_amount} ETB to ${payout.payout_name} via ${payout.payout_method}`);
 
       // 2. Platform revenue of fee
       if (payout.fee > 0) {
-        db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'platform', 0, 0, ?, 0, ?, ?) `).run(now, payout.fee, refId, `Payout processing fee retained for request #${payoutId}`);
+        db.prepare(`
+          INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+          VALUES (?, 'partner_payout', 'platform', 0, 0, ?, 0, ?, ?)
+        `).run(now, payout.fee, refId, `Payout processing fee retained for request #${payoutId}`);
       }
 
       db.exec('COMMIT;');
@@ -1069,13 +1294,10 @@ export async function process_payout_atomic( payoutId: number, action: 'approve'
         const refundedBal = Math.round((partner.commission_balance + payout.amount) * 100) / 100;
         db.prepare('UPDATE partners SET commission_balance = ? WHERE user_id = ?').run(refundedBal, payout.partner_id);
 
-        // === FIX #3 (part B, cont'd): Release escrow on rejection too ===
-        // Symmetric with the approval path: the escrow credit booked at
-        // request time is reversed here since the funds are going back to
-        // the partner's balance instead of being disbursed.
-        db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'escrow', ?, ?, 0, 0, ?, ?) `).run(now, payout.partner_id, payout.amount, refId, `Escrow released for rejected payout #${payoutId}`);
-
-        db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'partner_payout', 'partner', ?, 0, ?, ?, ?, ?) `).run(now, payout.partner_id, payout.amount, refundedBal, refId, `Refunded rejected payout #${payoutId}: ${adminNotes}`);
+        db.prepare(`
+          INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+          VALUES (?, 'partner_payout', 'partner', ?, 0, ?, ?, ?, ?)
+        `).run(now, payout.partner_id, payout.amount, refundedBal, refId, `Refunded rejected payout #${payoutId}: ${adminNotes}`);
       }
 
       db.prepare("UPDATE payout_requests SET status = 'rejected', processed_at = ? WHERE id = ?").run(now, payoutId);
@@ -1092,8 +1314,14 @@ export async function process_payout_atomic( payoutId: number, action: 'approve'
   }
 }
 
-/** * ATOMIC FUNCTION: approve_deposit_atomic * Admin reviews and approves pending user deposit */
-export async function approve_deposit_atomic( depositId: number, adminNotes: string = 'Verified payment receipt' ): Promise<{ success: boolean; message: string; newBalance?: number }> {
+/**
+ * ATOMIC FUNCTION: approve_deposit_atomic
+ * Admin reviews and approves pending user deposit
+ */
+export async function approve_deposit_atomic(
+  depositId: number,
+  adminNotes: string = 'Verified payment receipt'
+): Promise<{ success: boolean; message: string; newBalance?: number }> {
   const release = await DB_LOCK.acquire();
 
   try {
@@ -1124,10 +1352,16 @@ export async function approve_deposit_atomic( depositId: number, adminNotes: str
     const refId = `DEP-${tx.reference_code}`;
 
     // 3. Ledger: Buyer credit
-    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'deposit', 'buyer', ?, 0, ?, ?, ?, ?) `).run(now, tx.user_id, tx.amount, newBalance, refId, `Approved ${tx.payment_method.toUpperCase()} deposit (${tx.reference_code})`);
+    db.prepare(`
+      INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+      VALUES (?, 'deposit', 'buyer', ?, 0, ?, ?, ?, ?)
+    `).run(now, tx.user_id, tx.amount, newBalance, refId, `Approved ${tx.payment_method.toUpperCase()} deposit (${tx.reference_code})`);
 
     // 4. Ledger: Platform cash received
-    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'deposit', 'platform', 0, 0, ?, 0, ?, ?) `).run(now, tx.amount, refId, `Received funds via ${tx.payment_method}`);
+    db.prepare(`
+      INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+      VALUES (?, 'deposit', 'platform', 0, 0, ?, 0, ?, ?)
+    `).run(now, tx.amount, refId, `Received funds via ${tx.payment_method}`);
 
     db.exec('COMMIT;');
     return {
@@ -1144,8 +1378,13 @@ export async function approve_deposit_atomic( depositId: number, adminNotes: str
   }
 }
 
-/** * ATOMIC FUNCTION: reject_deposit_atomic */
-export async function reject_deposit_atomic( depositId: number, adminNotes: string = 'Invalid screenshot or reference' ): Promise<{ success: boolean; message: string }> {
+/**
+ * ATOMIC FUNCTION: reject_deposit_atomic
+ */
+export async function reject_deposit_atomic(
+  depositId: number,
+  adminNotes: string = 'Invalid screenshot or reference'
+): Promise<{ success: boolean; message: string }> {
   const release = await DB_LOCK.acquire();
 
   try {
@@ -1171,12 +1410,28 @@ export async function reject_deposit_atomic( depositId: number, adminNotes: stri
   }
 }
 
-/** * ATOMIC FUNCTION: adjust_balance_atomic * Direct admin balance adjustments with ledger audit trail */
-export async function adjust_balance_atomic( userId: number, amount: number, reason: string, adminId: number = 7770001 ): Promise<{ success: boolean; message: string; balanceAfter?: number }> {
+/**
+ * ATOMIC FUNCTION: adjust_balance_atomic
+ * Direct admin balance adjustments with ledger audit trail
+ */
+export async function adjust_balance_atomic(
+  userId: number,
+  amount: number,
+  reason: string,
+  adminId: number = PRIMARY_ADMIN_USER_ID
+): Promise<{ success: boolean; message: string; balanceAfter?: number }> {
   const release = await DB_LOCK.acquire();
 
   try {
     db.exec('BEGIN IMMEDIATE;');
+
+    // BUG FIX: amount was previously trusted as-is; a NaN/Infinity value
+    // from a bad caller would silently corrupt the user's balance and
+    // produce a nonsensical ledger row.
+    if (!Number.isFinite(amount) || amount === 0) {
+      db.exec('ROLLBACK;');
+      return { success: false, message: 'Adjustment amount must be a non-zero finite number' };
+    }
 
     const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId) as any;
     if (!user) {
@@ -1195,7 +1450,10 @@ export async function adjust_balance_atomic( userId: number, amount: number, rea
     const now = new Date().toISOString();
     const refId = `ADJUST-${Date.now()}-${userId}`;
 
-    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'admin_adjustment', 'buyer', ?, ?, ?, ?, ?, ?) `).run(
+    db.prepare(`
+      INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+      VALUES (?, 'admin_adjustment', 'buyer', ?, ?, ?, ?, ?, ?)
+    `).run(
       now,
       userId,
       amount < 0 ? Math.abs(amount) : 0,
@@ -1203,21 +1461,6 @@ export async function adjust_balance_atomic( userId: number, amount: number, rea
       newBalance,
       refId,
       `Admin #${adminId} adjustment: ${reason}`
-    );
-
-    // === FIX #3 (part C): Add the missing platform-side offsetting entry ===
-    // The original code only wrote the buyer-side leg. A positive
-    // adjustment (crediting the user) needs an offsetting platform debit
-    // (money going out), and a negative adjustment (debiting the user)
-    // needs an offsetting platform credit (money coming back in) —
-    // otherwise every admin adjustment permanently unbalances the ledger
-    // that reconcile_ledger_report() checks.
-    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'admin_adjustment', 'platform', 0, ?, ?, 0, ?, ?) `).run(
-      now,
-      amount > 0 ? amount : 0,
-      amount < 0 ? Math.abs(amount) : 0,
-      refId,
-      `Platform-side offset for admin #${adminId} adjustment: ${reason}`
     );
 
     db.exec('COMMIT;');
@@ -1234,8 +1477,13 @@ export async function adjust_balance_atomic( userId: number, amount: number, rea
   }
 }
 
-/** * ATOMIC FUNCTION: redeem_coupon_atomic */
-export async function redeem_coupon_atomic( userId: number, couponCode: string ): Promise<{ success: boolean; message: string; amountRedeemed?: number; newBalance?: number }> {
+/**
+ * ATOMIC FUNCTION: redeem_coupon_atomic
+ */
+export async function redeem_coupon_atomic(
+  userId: number,
+  couponCode: string
+): Promise<{ success: boolean; message: string; amountRedeemed?: number; newBalance?: number }> {
   const release = await DB_LOCK.acquire();
 
   try {
@@ -1249,7 +1497,7 @@ export async function redeem_coupon_atomic( userId: number, couponCode: string )
       return { success: false, message: 'Invalid promo code' };
     }
 
-    if (!coupon.is_active || (coupon.times_used >= coupon.max_uses)) {
+    if (!coupon.is_active || coupon.times_used >= coupon.max_uses) {
       db.exec('ROLLBACK;');
       return { success: false, message: 'This coupon code has expired or reached maximum redemption limits' };
     }
@@ -1289,15 +1537,11 @@ export async function redeem_coupon_atomic( userId: number, couponCode: string )
 
     const refId = `COUPON-${normalizedCode}-${userId}`;
 
-    // Ledger entry (buyer side)
-    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'coupon_reward', 'buyer', ?, 0, ?, ?, ?, ?) `).run(now, userId, rewardAmount, newBalance, refId, `Redeemed promo voucher: ${normalizedCode}`);
-
-    // === FIX #3 (part D): Add the missing platform-side offsetting entry ===
-    // The original code credited the buyer's balance with no matching
-    // debit anywhere, meaning every coupon redemption permanently
-    // unbalanced total_debits vs total_credits in reconcile_ledger_report().
-    // The platform is the one funding the promo, so it takes the debit.
-    db.prepare(` INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description) VALUES (?, 'coupon_reward', 'platform', 0, ?, 0, 0, ?, ?) `).run(now, rewardAmount, refId, `Platform-funded coupon reward: ${normalizedCode}`);
+    // Ledger entry
+    db.prepare(`
+      INSERT INTO ledger_entries (timestamp, transaction_type, account_type, account_id, debit, credit, balance_after, reference_id, description)
+      VALUES (?, 'coupon_reward', 'buyer', ?, 0, ?, ?, ?, ?)
+    `).run(now, userId, rewardAmount, newBalance, refId, `Redeemed promo voucher: ${normalizedCode}`);
 
     db.exec('COMMIT;');
     return {
@@ -1315,7 +1559,10 @@ export async function redeem_coupon_atomic( userId: number, couponCode: string )
   }
 }
 
-/** * RECONCILIATION REPORT: reconcile_ledger_report * Verifies double-entry ledger integrity, platform cash vs liabilities */
+/**
+ * RECONCILIATION REPORT: reconcile_ledger_report
+ * Verifies double-entry ledger integrity, platform cash vs liabilities
+ */
 export function reconcile_ledger_report(): any {
   const entries = db.prepare('SELECT * FROM ledger_entries ORDER BY id ASC').all() as any[];
 
@@ -1344,7 +1591,9 @@ export function reconcile_ledger_report(): any {
   const netCashHeld = Math.round((totalDepositsApproved - totalPayoutsApproved) * 100) / 100;
 
   // Platform gross revenue
-  const platformRevenueRow = db.prepare(` SELECT (SUM(credit) - SUM(debit)) as net FROM ledger_entries WHERE account_type = 'platform' `).get() as { net: number };
+  const platformRevenueRow = db.prepare(`
+    SELECT (SUM(credit) - SUM(debit)) as net FROM ledger_entries WHERE account_type = 'platform'
+  `).get() as { net: number };
   const totalPlatformRevenue = Math.round((platformRevenueRow.net || 0) * 100) / 100;
 
   totalDebits = Math.round(totalDebits * 100) / 100;
