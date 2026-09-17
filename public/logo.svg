@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 200" fill="none">
+  <!-- ORO RECORDS Eagle Chevron Mark -->
+  <g transform="translate(10, 10)">
+    <!-- Main Green Chevron / Falcon Wing with Eagle Profile cutout -->
+    <path d="M 30,25 
+             L 95,78 
+             C 102,84 102,94 95,100 
+             L 30,153 
+             C 24,158 15,153 15,145 
+             L 15,125 
+             C 15,120 18,115 22,112 
+             L 60,89 
+             L 22,66 
+             C 18,63 15,58 15,53 
+             L 15,33 
+             C 15,25 24,20 30,25 Z" 
+          fill="#22C55E" />
+
+    <!-- Detailed stylized Eagle Silhouette carved into chevron -->
+    <path d="M 60,89 
+             L 72,83 
+             C 76,81 79,84 81,87 
+             L 76,90 
+             C 74,91 71,90 68,89 
+             L 60,89 Z" 
+          fill="#0B0E14" opacity="0.3" />
+    
+    <!-- Eagle Eye Accent -->
+    <circle cx="68" cy="84" r="2.5" fill="#FFFFFF" />
+  </g>
+
+  <!-- Typography: ORO -->
+  <g transform="translate(145, 88)">
+    <text x="0" y="0" 
+          font-family="'Impact', 'Arial Black', 'Cinzel', sans-serif" 
+          font-weight="900" 
+          font-size="64" 
+          letter-spacing="4" 
+          fill="#22C55E">ORO</text>
+  </g>
+
+  <!-- Typography: RECORDS -->
+  <g transform="translate(147, 128)">
+    <text x="0" y="0" 
+          font-family="'Plus Jakarta Sans', 'Arial Black', sans-serif" 
+          font-weight="900" 
+          font-size="28" 
+          letter-spacing="7" 
+          fill="#FFFFFF" 
+          stroke="#0B0E14" 
+          stroke-width="1.5">RECORDS</text>
+  </g>
+
+  <!-- Decorative Cinema soundwave / accent dots -->
+  <circle cx="390" cy="56" r="3" fill="#22C55E" />
+  <circle cx="400" cy="56" r="3" fill="#16A34A" />
+  <circle cx="410" cy="56" r="3" fill="#15803D" />
+</svg>

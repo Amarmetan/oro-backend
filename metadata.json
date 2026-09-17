@@ -1,0 +1,6 @@
+{
+  "name": "ORO RECORDS — Companion App",
+  "description": "Telegram Mini App companion for ORO RECORDS with atomic double-entry ledger, Ethiopian payment integration, partner distribution & admin reconciliation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
