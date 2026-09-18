@@ -272,7 +272,7 @@ function seedDefaultData() {
           'Exclusive 4K Premiere: Hunda Dura',
           'The landmark cultural drama is now streaming in pristine 4K UHD. Get 50% discount with VIP Cinephile Pass!',
           'https://images.unsplash.com/photo-1518676590629-3dcbd9c5a5c9?w=800&auto=format&fit=crop&q=80',
-          'https://t.me/OroRecordsBot?start=movie_1',
+          'https://t.me/OroRecords_Bot?start=movie_1',
           'HOT PREMIERE',
           now
         );
@@ -288,14 +288,14 @@ function seedDefaultData() {
   // Settings
   const defaultSettings: Record<string, string> = {
     cbe_account: '1000234567890 (Commercial Bank of Ethiopia - ORO RECORDS)',
-    telebirr_phone: '+251911223344 (ORO Entertainment Telebirr SuperApp)',
-    ebirr_account: '+251977889900 (Coop Bank of Oromia / E-Birr)',
-    sinqee_account: '300456789 (Sinqee Bank S.C. - ORO Media)',
+    telebirr_phone: '+251919113414 (Telebirr AMAR ABDULATIF)',
+    ebirr_account: '+251919113414 (E-Birr)',
+    sinqee_account: '1041000053912 (COPPARATIVE BANK OF OROMIA CBO. - AMAR ABDULATIF)',
     withdrawal_fee_percent: '2.5',
     withdrawal_min_fee: '10.0',
     min_withdrawal_amount: '100.0',
     vip_monthly_price: '250.0',
-    telegram_bot_username: '@OroRecordsBot',
+    telegram_bot_username: '@OroRecords_Bot',
     custom_logo_url: '/logo.svg',
     partner_tos_text: 'ORO RECORDS Partner Distribution Agreement: Creators & producers receive 70% commission on all single movie transactions and proportional shares on category bundles. Payouts are reconciled via Telebirr or CBE within 24 hours. Submitted films must possess legitimate Ethiopian copyright and broadcast clearance.',
   };
