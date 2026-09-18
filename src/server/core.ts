@@ -220,6 +220,11 @@ export function initDatabase() {
     db.exec('ALTER TABLE users ADD COLUMN is_registered INTEGER NOT NULL DEFAULT 0;');
   } catch (e) {}
   try {
+  db.exec("UPDATE movies SET bot_deep_link = REPLACE(bot_deep_link, '@ORORECORDSBOT', 'ORORECORDS_BOT');");
+  db.exec("UPDATE movies SET bot_link = REPLACE(bot_link, 'ORORECORDSBOT', 'ORORECORDS_BOT');");
+} catch (e) {}
+
+  try {
     db.exec('ALTER TABLE users ADD COLUMN phone_number TEXT;');
   } catch (e) {}
   try {
